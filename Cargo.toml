@@ -1,0 +1,15 @@
+[package]
+name = "skycuda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = [
+    "cuda-version-from-build-system",
+    "dynamic-loading",
+    "driver",
+    "std",
+] }
+thiserror = "2"
+bytemuck = "1"
+range-alloc = "0.1"
