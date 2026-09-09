@@ -18,7 +18,7 @@ use cudarc::driver::sys::{
     cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute,
 };
 
-use crate::{error::Result, event::Event, stream::Stream};
+use crate::{device_memory_pool::DeviceMemoryPool, error::Result, event::Event, stream::Stream};
 
 #[derive(Debug, Clone)]
 pub struct Device(Arc<Inner>);
@@ -62,6 +62,10 @@ impl Device {
 
     pub fn create_event(&self) -> Result<Event> {
         Event::new(self)
+    }
+
+    pub fn create_device_memory_pool(&self) -> Result<DeviceMemoryPool> {
+        DeviceMemoryPool::new(self)
     }
 
     pub fn ordinal(&self) -> u32 {

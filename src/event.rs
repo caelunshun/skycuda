@@ -1,4 +1,8 @@
-use std::{ptr, sync::Arc};
+use std::{
+    fmt::Debug,
+    mem, ptr,
+    sync::{Arc, Mutex},
+};
 
 use cudarc::driver::sys::{
     CUevent,
@@ -24,6 +28,7 @@ impl Event {
         Ok(Self(Arc::new(Inner {
             device: device.clone(),
             cu_event,
+            synchronize_callbacks: Mutex::new(Vec::new()),
         })))
     }
 
@@ -40,6 +45,7 @@ impl Event {
         unsafe {
             cuEventSynchronize(self.0.cu_event).result()?;
         }
+        self.completion_observed()?;
         Ok(())
     }
 
@@ -49,13 +55,41 @@ impl Event {
 
     pub fn cu_event(&self) -> CUevent {
         self.0.cu_event
+    } 
+
+    pub(crate) fn on_complete(
+        &self,
+        callback: impl FnOnce() -> Result<()> + Send + Sync + 'static,
+    ) {
+        self.0
+            .synchronize_callbacks
+            .lock()
+            .unwrap()
+            .push(Box::new(callback));
+    }
+
+    pub(crate) fn completion_observed(&self) -> Result<()> {
+        let callbacks = mem::take(&mut *self.0.synchronize_callbacks.lock().unwrap());
+        for callback in callbacks {
+            callback()?;
+        }
+        Ok(())
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     device: Device,
     cu_event: CUevent,
+    synchronize_callbacks: Mutex<Vec<Box<dyn FnOnce() -> Result<()> + Send + Sync>>>,
+}
+
+impl Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("device", &self.device)
+            .field("cu_event", &self.cu_event)
+            .finish()
+    }
 }
 
 impl Drop for Inner {
