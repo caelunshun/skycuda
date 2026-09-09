@@ -51,7 +51,6 @@ impl DeviceMemory {
             len,
             state: Mutex::new(State {
                 last_written_stream: stream.clone(),
-                last_written_event,
                 reading_by_streams: Vec::new(),
             }),
         })
@@ -88,14 +87,15 @@ impl DeviceMemory {
 
 impl Drop for DeviceMemory {
     fn drop(&mut self) {
-        let _ = unsafe { self.free() };
+        if self.len > 0 {
+            let _ = unsafe { self.free() };
+        }
     }
 }
 
 #[derive(Debug)]
 struct State {
     last_written_stream: Stream,
-    last_written_event: Event,
     reading_by_streams: Vec<Stream>,
 }
 
@@ -107,10 +107,14 @@ impl DeviceVisibleMemory for DeviceMemory {
     }
 
     fn access_on<'a>(&'a self, stream: &'a Stream) -> Result<DeviceMemoryGuard<'a>> {
+        assert_eq!(self.device(), stream.device());
+
         let mut state = self.state.lock().unwrap();
 
         if stream != &state.last_written_stream && !state.reading_by_streams.contains(&stream) {
-            stream.wait_on_event(&state.last_written_event)?;
+            let event = self.device().create_event()?;
+            state.last_written_stream.record_event(&event)?;
+            stream.wait_on_event(&event)?;
             state.reading_by_streams.push(stream.clone());
         }
 
@@ -122,11 +126,14 @@ impl DeviceVisibleMemoryMut for DeviceMemory {
     type GuardMut<'a> = DeviceMemoryGuardMut<'a>;
 
     fn access_mut_on<'a>(&'a mut self, stream: &'a Stream) -> Result<DeviceMemoryGuardMut<'a>> {
+        assert_eq!(self.device(), stream.device());
         let mut state = self.state.lock().unwrap();
 
         if state.reading_by_streams.is_empty() {
             if stream != &state.last_written_stream {
-                stream.wait_on_event(&state.last_written_event)?;
+                let event = self.device().create_event()?;
+                state.last_written_stream.record_event(&event)?;
+                stream.wait_on_event(&event)?;
             }
         } else {
             for reader_stream in state.reading_by_streams.drain(..) {

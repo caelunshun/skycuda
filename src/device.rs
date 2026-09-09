@@ -18,7 +18,13 @@ use cudarc::driver::sys::{
     cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute,
 };
 
-use crate::{device_memory_pool::DeviceMemoryPool, error::Result, event::Event, stream::Stream};
+use crate::{
+    device_memory_pool::DeviceMemoryPool,
+    error::Result,
+    event::Event,
+    host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
+    stream::Stream,
+};
 
 #[derive(Debug, Clone)]
 pub struct Device(Arc<Inner>);
@@ -68,6 +74,13 @@ impl Device {
         DeviceMemoryPool::new(self)
     }
 
+    pub fn create_host_pinned_memory_pool(
+        &self,
+        options: HostPinnedMemoryPoolOptions,
+    ) -> Result<HostPinnedMemoryPool> {
+        HostPinnedMemoryPool::new(options, self)
+    }
+
     pub fn ordinal(&self) -> u32 {
         self.0.device_ordinal.try_into().unwrap()
     }
@@ -107,6 +120,14 @@ impl Device {
         self.0.cached_attributes.max_dynamic_smem
     }
 }
+
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Device {}
 
 #[derive(Debug)]
 struct Inner {
