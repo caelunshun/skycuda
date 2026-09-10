@@ -1,7 +1,7 @@
 use std::{
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -15,13 +15,15 @@ use cudarc::driver::sys::{
         CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
         CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
     },
-    cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute,
+    CUevent,
+    CUevent_flags::CU_EVENT_DISABLE_TIMING,
+    cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
+    cuEventDestroy_v2,
 };
 
 use crate::{
     device_memory_pool::DeviceMemoryPool,
     error::Result,
-    event::Event,
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
     stream::Stream,
 };
@@ -59,15 +61,12 @@ impl Device {
             device_ordinal: ordinal,
             cu_context,
             cached_attributes,
+            cu_event_pool: Mutex::new(Vec::new()),
         })))
     }
 
     pub fn create_stream(&self) -> Result<Stream> {
         Stream::new(self)
-    }
-
-    pub fn create_event(&self) -> Result<Event> {
-        Event::new(self)
     }
 
     pub fn create_device_memory_pool(&self) -> Result<DeviceMemoryPool> {
@@ -119,6 +118,24 @@ impl Device {
     pub fn max_dynamic_smem_per_cta(&self) -> usize {
         self.0.cached_attributes.max_dynamic_smem
     }
+
+    pub(crate) fn take_pooled_cu_event(&self) -> Result<CUevent> {
+        match self.0.cu_event_pool.lock().unwrap().pop() {
+            Some(event) => Ok(event),
+            None => {
+                let mut event = ptr::null_mut();
+                unsafe {
+                    cuEventCreate(&mut event, CU_EVENT_DISABLE_TIMING as u32).result()?;
+                }
+                Ok(event)
+            }
+        }
+    }
+
+    pub(crate) fn release_pooled_cu_event(&self, cu_event: CUevent) -> Result<()> {
+        self.0.cu_event_pool.lock().unwrap().push(cu_event);
+        Ok(())
+    }
 }
 
 impl PartialEq for Device {
@@ -135,6 +152,7 @@ struct Inner {
     device_ordinal: i32,
     cu_context: CUcontext,
     cached_attributes: CachedAttributes,
+    cu_event_pool: Mutex<Vec<CUevent>>,
 }
 
 unsafe impl Send for Inner {}
@@ -143,6 +161,10 @@ unsafe impl Sync for Inner {}
 impl Drop for Inner {
     fn drop(&mut self) {
         unsafe {
+            for cu_event in self.cu_event_pool.get_mut().unwrap().drain(..) {
+                let _ = cuEventDestroy_v2(cu_event).result();
+            }
+
             let _ = cuCtxDestroy_v2(self.cu_context).result();
         }
     }

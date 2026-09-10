@@ -29,17 +29,17 @@ impl Stream {
         Ok(Self(Arc::new(Inner {
             device: device.clone(),
             cu_stream,
-            synchronize_callbacks: Mutex::new(Vec::new()),
             recorded_events: Mutex::new(Vec::new()),
         })))
     }
 
-    pub fn record_event(&self, event: &Event) -> Result<()> {
+    pub fn record_event(&self) -> Result<Event> {
+        let event = Event::new(self.device())?;
         unsafe {
             cuEventRecord(event.cu_event(), self.0.cu_stream).result()?;
         }
         self.0.recorded_events.lock().unwrap().push(event.clone());
-        Ok(())
+        Ok(event)
     }
 
     pub fn wait_on_event(&self, event: &Event) -> Result<()> {
@@ -61,7 +61,7 @@ impl Stream {
         unsafe {
             cuStreamSynchronize(self.0.cu_stream).result()?;
         }
-
+        self.notify_completion_observed()?;
         Ok(())
     }
 
@@ -72,7 +72,7 @@ impl Stream {
 
         match res {
             CUDA_SUCCESS => {
-                self.completion_observed()?;
+                self.notify_completion_observed()?;
                 Ok(true)
             }
             CUDA_ERROR_NOT_READY => Ok(false),
@@ -88,28 +88,12 @@ impl Stream {
         self.0.cu_stream
     }
 
-    pub(crate) fn completion_observed(&self) -> Result<()> {
-        let callbacks = mem::take(&mut *self.0.synchronize_callbacks.lock().unwrap());
-        for callback in callbacks {
-            callback()?;
-        }
-
+    pub(crate) fn notify_completion_observed(&self) -> Result<()> {
         let events = mem::take(&mut *self.0.recorded_events.lock().unwrap());
         for event in events {
-            event.completion_observed()?;
+            event.notify_completion_observed()?;
         }
         Ok(())
-    }
-
-    pub(crate) fn on_complete(
-        &self,
-        callback: impl FnOnce() -> Result<()> + Send + Sync + 'static,
-    ) {
-        self.0
-            .synchronize_callbacks
-            .lock()
-            .unwrap()
-            .push(Box::new(callback));
     }
 }
 
@@ -121,20 +105,11 @@ impl PartialEq for Stream {
 
 impl Eq for Stream {}
 
+#[derive(Debug)]
 struct Inner {
     device: Device,
     cu_stream: CUstream,
-    synchronize_callbacks: Mutex<Vec<Box<dyn FnOnce() -> Result<()> + Send + Sync>>>,
     recorded_events: Mutex<Vec<Event>>,
-}
-
-impl Debug for Inner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner")
-            .field("device", &self.device)
-            .field("cu_stream", &self.cu_stream)
-            .finish()
-    }
 }
 
 impl Drop for Inner {

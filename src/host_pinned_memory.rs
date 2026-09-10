@@ -5,11 +5,9 @@ use std::{
 };
 
 use crate::{
-    device::Device,
     error::Result,
     event::Event,
     host_pinned_memory_pool::{HostPinnedAllocation, HostPinnedMemoryPool},
-    stream::Stream,
 };
 
 #[derive(Debug)]
@@ -35,7 +33,7 @@ impl HostPinnedMemory {
     }
 
     fn make_host_exclusive(&self) -> Result<()> {
-        let mut state = self.0.state.lock().unwrap();
+        let state = self.0.state.lock().unwrap();
 
         match &*state {
             State::HostExclusive => return Ok(()),
@@ -65,7 +63,7 @@ impl Drop for HostPinnedMemory {
                 // Need to keep Inner alive until
                 // device is done using it.
                 let inner = self.0.clone();
-                done_event.on_complete(move || {
+                done_event.on_completion_observed(move || {
                     drop(inner);
                     Ok(())
                 });
@@ -75,7 +73,7 @@ impl Drop for HostPinnedMemory {
                 // device is done using it.
                 for done_event in done_events {
                     let inner = self.0.clone();
-                    done_event.on_complete(move || {
+                    done_event.on_completion_observed(move || {
                         drop(inner);
                         Ok(())
                     });

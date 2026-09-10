@@ -5,7 +5,7 @@ use cudarc::driver::sys::{
 };
 
 use crate::{
-    device::Device, device_memory_pool::DeviceMemoryPool, error::Result, event::Event,
+    device::Device, device_memory_pool::DeviceMemoryPool, error::Result,
     stream::Stream,
 };
 
@@ -42,9 +42,6 @@ impl DeviceMemory {
             }
         }
 
-        let last_written_event = mem_pool.device().create_event()?;
-        stream.record_event(&last_written_event)?;
-
         Ok(Self {
             mem_pool: mem_pool.clone(),
             ptr,
@@ -72,8 +69,7 @@ impl DeviceMemory {
         let state = self.state.lock().unwrap();
 
         for stream in &state.reading_by_streams {
-            let event = self.device().create_event()?;
-            stream.record_event(&event)?;
+            let event = stream.record_event()?;
             state.last_written_stream.wait_on_event(&event)?;
         }
 
@@ -112,8 +108,7 @@ impl DeviceVisibleMemory for DeviceMemory {
         let mut state = self.state.lock().unwrap();
 
         if stream != &state.last_written_stream && !state.reading_by_streams.contains(&stream) {
-            let event = self.device().create_event()?;
-            state.last_written_stream.record_event(&event)?;
+            let event = state.last_written_stream.record_event()?;
             stream.wait_on_event(&event)?;
             state.reading_by_streams.push(stream.clone());
         }
@@ -131,14 +126,12 @@ impl DeviceVisibleMemoryMut for DeviceMemory {
 
         if state.reading_by_streams.is_empty() {
             if stream != &state.last_written_stream {
-                let event = self.device().create_event()?;
-                state.last_written_stream.record_event(&event)?;
+                let event =   state.last_written_stream.record_event()?;
                 stream.wait_on_event(&event)?;
             }
         } else {
             for reader_stream in state.reading_by_streams.drain(..) {
-                let event = self.device().create_event()?;
-                reader_stream.record_event(&event)?;
+                let event = reader_stream.record_event()?;
                 stream.wait_on_event(&event)?;
             }
         }

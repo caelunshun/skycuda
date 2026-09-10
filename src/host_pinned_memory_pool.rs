@@ -18,14 +18,14 @@ impl HostPinnedMemoryPool {
     const MIN_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
     pub(crate) fn new(options: HostPinnedMemoryPoolOptions, device: &Device) -> Result<Self> {
-        Ok((Self(
+        Ok(Self(
             Arc::new(Mutex::new(Inner {
                 options,
                 chunks: Vec::new(),
                 free_bytes: 0,
             })),
             device.clone(),
-        )))
+        ))
     }
 
     pub(crate) unsafe fn alloc(&self, len: usize) -> Result<HostPinnedAllocation> {

@@ -1,30 +1,28 @@
 use std::{
     fmt::Debug,
-    mem, ptr,
+    mem,
     sync::{Arc, Mutex},
 };
 
 use cudarc::driver::sys::{
     CUevent,
-    CUevent_flags::CU_EVENT_DISABLE_TIMING,
-    CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS},
-    cuEventCreate, cuEventDestroy_v2, cuEventQuery, cuEventSynchronize,
+    CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS}, cuEventQuery, cuEventSynchronize,
 };
 
 use crate::{device::Device, error::Result};
 
 /// CUDA event with no timing support, used
 /// only for synchronization.
+///
+/// Unlike raw CUDA events, an event is recorded
+/// only once. We pool raw events internally to facilitate
+/// reuse.
 #[derive(Debug, Clone)]
 pub struct Event(Arc<Inner>);
 
 impl Event {
     pub(crate) fn new(device: &Device) -> Result<Self> {
-        let mut cu_event = ptr::null_mut();
-        unsafe {
-            cuEventCreate(&mut cu_event, CU_EVENT_DISABLE_TIMING as u32).result()?;
-        };
-
+        let cu_event = device.take_pooled_cu_event()?;
         Ok(Self(Arc::new(Inner {
             device: device.clone(),
             cu_event,
@@ -45,7 +43,7 @@ impl Event {
         unsafe {
             cuEventSynchronize(self.0.cu_event).result()?;
         }
-        self.completion_observed()?;
+        self.notify_completion_observed()?;
         Ok(())
     }
 
@@ -55,9 +53,9 @@ impl Event {
 
     pub fn cu_event(&self) -> CUevent {
         self.0.cu_event
-    } 
+    }
 
-    pub(crate) fn on_complete(
+    pub(crate) fn on_completion_observed(
         &self,
         callback: impl FnOnce() -> Result<()> + Send + Sync + 'static,
     ) {
@@ -68,7 +66,7 @@ impl Event {
             .push(Box::new(callback));
     }
 
-    pub(crate) fn completion_observed(&self) -> Result<()> {
+    pub(crate) fn notify_completion_observed(&self) -> Result<()> {
         let callbacks = mem::take(&mut *self.0.synchronize_callbacks.lock().unwrap());
         for callback in callbacks {
             callback()?;
@@ -80,6 +78,7 @@ impl Event {
 struct Inner {
     device: Device,
     cu_event: CUevent,
+    #[allow(clippy::type_complexity)]
     synchronize_callbacks: Mutex<Vec<Box<dyn FnOnce() -> Result<()> + Send + Sync>>>,
 }
 
@@ -94,9 +93,7 @@ impl Debug for Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        unsafe {
-            let _ = cuEventDestroy_v2(self.cu_event).result();
-        }
+        let _ = self.device.release_pooled_cu_event(self.cu_event);
     }
 }
 
