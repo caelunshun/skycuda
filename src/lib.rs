@@ -8,7 +8,7 @@ pub mod event;
 pub mod function;
 pub mod host_pinned_memory;
 pub mod host_pinned_memory_pool;
+pub mod launch;
 pub mod memory_slice;
 pub mod module;
 pub mod stream;
-pub mod launch;

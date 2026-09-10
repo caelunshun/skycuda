@@ -1,5 +1,4 @@
-use std::{ffi::c_void, ptr, sync::Arc};
-
+use crate::{device::Device, device_memory::DeviceMemory, error::Result, stream::Stream};
 use cudarc::driver::sys::{
     CUmemAllocationHandleType, CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
     CUmemLocation_st, CUmemLocation_st__bindgen_ty_1,
@@ -7,8 +6,7 @@ use cudarc::driver::sys::{
     CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, CUmemPoolProps_st, CUmemoryPool,
     cuMemPoolCreate, cuMemPoolDestroy, cuMemPoolSetAttribute,
 };
-
-use crate::{device::Device, device_memory::DeviceMemory, error::Result, stream::Stream};
+use std::{ffi::c_void, ptr, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct DeviceMemoryPool(Arc<Inner>);

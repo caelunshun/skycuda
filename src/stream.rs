@@ -1,19 +1,3 @@
-use std::{
-    fmt::Debug,
-    mem, ptr,
-    sync::{Arc, Mutex},
-};
-
-use bytemuck::Pod;
-use cudarc::driver::sys::{
-    CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-    CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS},
-    CUstream,
-    CUstream_flags::CU_STREAM_NON_BLOCKING,
-    cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async, cuStreamCreate,
-    cuStreamDestroy_v2, cuStreamQuery, cuStreamSynchronize, cuStreamWaitEvent,
-};
-
 use crate::{
     device::Device,
     device_memory::{
@@ -23,6 +7,20 @@ use crate::{
     event::Event,
     function::Function,
     launch::LaunchBuilder,
+};
+use bytemuck::Pod;
+use cudarc::driver::sys::{
+    CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+    CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS},
+    CUstream,
+    CUstream_flags::CU_STREAM_NON_BLOCKING,
+    cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async, cuStreamCreate,
+    cuStreamDestroy_v2, cuStreamQuery, cuStreamSynchronize, cuStreamWaitEvent,
+};
+use std::{
+    fmt::Debug,
+    mem, ptr,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Clone)]

@@ -1,13 +1,3 @@
-use std::{
-    any::type_name_of_val,
-    ptr::{self, NonNull},
-};
-
-use bumpalo::Bump;
-use bytemuck::Pod;
-use cudarc::driver::sys::{CUdeviceptr_v2, cuLaunchKernel};
-use half::{bf16, f16};
-
 use crate::{
     device_memory::{
         DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
@@ -15,6 +5,14 @@ use crate::{
     error::Result,
     function::Function,
     stream::Stream,
+};
+use bumpalo::Bump;
+use bytemuck::Pod;
+use cudarc::driver::sys::{CUdeviceptr_v2, cuLaunchKernel};
+use half::{bf16, f16};
+use std::{
+    any::type_name_of_val,
+    ptr::{self, NonNull},
 };
 
 pub struct LaunchBuilder<'a> {

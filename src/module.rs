@@ -1,8 +1,6 @@
-use std::{ptr, sync::Arc};
-
-use cudarc::driver::sys::{CUmodule, cuModuleLoadData};
-
 use crate::{device::Device, error::Result, function::Function};
+use cudarc::driver::sys::{CUmodule, cuModuleLoadData};
+use std::{ptr, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct Module(Arc<Inner>);

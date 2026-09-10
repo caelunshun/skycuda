@@ -1,16 +1,14 @@
-use std::{
-    fmt::Debug,
-    mem,
-    sync::{Arc, Mutex},
-};
-
+use crate::{device::Device, error::Result, stream::Stream};
 use cudarc::driver::sys::{
     CUevent,
     CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS},
     cuEventQuery, cuEventRecord, cuEventSynchronize,
 };
-
-use crate::{device::Device, error::Result, stream::Stream};
+use std::{
+    fmt::Debug,
+    mem,
+    sync::{Arc, Mutex},
+};
 
 /// CUDA event with no timing support, used
 /// only for synchronization.

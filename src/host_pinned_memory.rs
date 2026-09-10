@@ -1,12 +1,3 @@
-use std::{
-    mem::MaybeUninit,
-    ops::RangeBounds,
-    slice,
-    sync::{Arc, Mutex, OnceLock},
-};
-
-use cudarc::driver::sys::CUdeviceptr_v2;
-
 use crate::{
     device_memory::{
         DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
@@ -16,6 +7,13 @@ use crate::{
     host_pinned_memory_pool::{HostPinnedMemoryPool, RawHostPinnedAllocation},
     memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
+};
+use cudarc::driver::sys::CUdeviceptr_v2;
+use std::{
+    mem::MaybeUninit,
+    ops::RangeBounds,
+    slice,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[derive(Debug)]

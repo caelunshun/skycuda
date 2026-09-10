@@ -1,14 +1,12 @@
-use std::{
-    ptr::{self, NonNull},
-    sync::{Arc, Mutex},
-};
-
+use crate::{device::Device, error::Result, host_pinned_memory::HostPinnedMemory};
 use cudarc::driver::sys::{
     CUdeviceptr_v2, cuMemAllocHost_v2, cuMemFreeHost, cuMemHostGetDevicePointer_v2,
 };
 use range_alloc::RangeAllocator;
-
-use crate::{device::Device, error::Result, host_pinned_memory::HostPinnedMemory};
+use std::{
+    ptr::{self, NonNull},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, Clone)]
 pub struct HostPinnedMemoryPool(Arc<Mutex<Inner>>, Device);

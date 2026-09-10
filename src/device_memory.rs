@@ -1,9 +1,3 @@
-use std::{ops::RangeBounds, sync::Mutex};
-
-use cudarc::driver::sys::{
-    CUdeviceptr_v2, cuMemAllocFromPoolAsync, cuMemFreeAsync, cuMemsetD8Async,
-};
-
 use crate::{
     device::Device,
     device_memory_pool::DeviceMemoryPool,
@@ -11,6 +5,10 @@ use crate::{
     memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
 };
+use cudarc::driver::sys::{
+    CUdeviceptr_v2, cuMemAllocFromPoolAsync, cuMemFreeAsync, cuMemsetD8Async,
+};
+use std::{ops::RangeBounds, sync::Mutex};
 
 /// Raw, untyped wrapper over a device-local memory allocation.
 /// This type of memory is only accessible to the GPU.

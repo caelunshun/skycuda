@@ -1,12 +1,10 @@
-use std::{
-    ffi::CString,
-    ptr,
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+use crate::{
+    device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
+    error::Result,
+    host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
+    module::Module,
+    stream::Stream,
 };
-
 use cudarc::driver::{
     DriverError,
     sys::{
@@ -25,13 +23,13 @@ use cudarc::driver::{
         cuEventDestroy_v2,
     },
 };
-
-use crate::{
-    device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
-    error::Result,
-    host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
-    module::Module,
-    stream::Stream,
+use std::{
+    ffi::CString,
+    ptr,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[derive(Debug, Clone)]

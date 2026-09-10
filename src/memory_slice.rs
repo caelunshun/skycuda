@@ -1,10 +1,8 @@
-use std::ops::RangeBounds;
-
-use cudarc::driver::sys::CUdeviceptr_v2;
-
 use crate::device_memory::{
     DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
 };
+use cudarc::driver::sys::CUdeviceptr_v2;
+use std::ops::RangeBounds;
 
 /// Read-only slice of device-visible memory.
 pub struct MemorySlice<T> {

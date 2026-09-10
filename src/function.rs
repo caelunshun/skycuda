@@ -1,10 +1,8 @@
-use std::{ffi::CString, ptr, sync::Arc};
-
+use crate::{device::Device, error::Result, module::Module};
 use cudarc::driver::sys::{
     CUfunction, cuFuncGetParamCount, cuFuncGetParamInfo, cuFuncLoad, cuModuleGetFunction,
 };
-
-use crate::{device::Device, error::Result, module::Module};
+use std::{ffi::CString, ptr, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct Function(Arc<Inner>);
