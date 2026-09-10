@@ -8,13 +8,13 @@ use cudarc::driver::sys::{
     cuMemPoolCreate, cuMemPoolDestroy, cuMemPoolSetAttribute,
 };
 
-use crate::{device::Device, error::Result};
+use crate::{device::Device, device_memory::DeviceMemory, error::Result, stream::Stream};
 
 #[derive(Debug, Clone)]
 pub struct DeviceMemoryPool(Arc<Inner>);
 
 impl DeviceMemoryPool {
-    pub(crate) fn new(device: &Device) -> Result<Self> {
+    pub(crate) fn new(options: DeviceMemoryPoolOptions, device: &Device) -> Result<Self> {
         device.set_as_current()?;
 
         let mut cu_mempool = ptr::null_mut();
@@ -32,8 +32,16 @@ impl DeviceMemoryPool {
             usage: 0,
             reserved: [0; _],
         };
+
+        let mut max_bytes = options.max_reserved_free_bytes as u64;
         unsafe {
             cuMemPoolCreate(&mut cu_mempool, &props).result()?;
+            cuMemPoolSetAttribute(
+                cu_mempool,
+                CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &mut max_bytes as *mut u64 as *mut c_void,
+            )
+            .result()?;
         }
 
         Ok(Self(Arc::new(Inner {
@@ -42,17 +50,8 @@ impl DeviceMemoryPool {
         })))
     }
 
-    pub fn set_max_reserved_free_bytes(&self, max_bytes: usize) -> Result<()> {
-        let mut max_bytes = u64::try_from(max_bytes)?;
-        unsafe {
-            cuMemPoolSetAttribute(
-                self.0.cu_mempool,
-                CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                &mut max_bytes as *mut u64 as *mut c_void,
-            )
-            .result()?;
-        }
-        Ok(())
+    pub fn alloc_zeroed_on(&self, len: usize, stream: &Stream) -> Result<DeviceMemory> {
+        DeviceMemory::new_zeroed(len, self, stream)
     }
 
     pub fn cu_mempool(&self) -> CUmemoryPool {
@@ -79,4 +78,9 @@ impl Drop for Inner {
             let _ = cuMemPoolDestroy(self.cu_mempool).result();
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceMemoryPoolOptions {
+    pub max_reserved_free_bytes: usize,
 }

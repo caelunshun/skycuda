@@ -8,7 +8,7 @@ use cudarc::driver::sys::{
 };
 use range_alloc::RangeAllocator;
 
-use crate::{device::Device, error::Result};
+use crate::{device::Device, error::Result, host_pinned_memory::HostPinnedMemory};
 
 #[derive(Debug, Clone)]
 pub struct HostPinnedMemoryPool(Arc<Mutex<Inner>>, Device);
@@ -28,7 +28,11 @@ impl HostPinnedMemoryPool {
         ))
     }
 
-    pub(crate) unsafe fn alloc(&self, len: usize) -> Result<HostPinnedAllocation> {
+    pub fn alloc_zeroed(&self, len: usize) -> Result<HostPinnedMemory> {
+        HostPinnedMemory::new_zeroed(len, self)
+    }
+
+    pub(crate) unsafe fn alloc_raw(&self, len: usize) -> Result<RawHostPinnedAllocation> {
         assert!(len > 0);
         let mut inner = self.0.lock().unwrap();
 
@@ -37,7 +41,7 @@ impl HostPinnedMemoryPool {
                 .allocator
                 .allocate_range_aligned(len, Self::GUARANTEED_ALIGNMENT)
             {
-                let allocation = HostPinnedAllocation {
+                let allocation = RawHostPinnedAllocation {
                     host_ptr: unsafe { chunk.host_ptr.add(range.start) },
                     device_ptr: chunk.device_ptr + range.start as u64,
                     len,
@@ -71,7 +75,7 @@ impl HostPinnedMemoryPool {
             .unwrap();
         inner.free_bytes += new_chunk_size - len;
 
-        let allocation = HostPinnedAllocation {
+        let allocation = RawHostPinnedAllocation {
             host_ptr: unsafe { chunk.host_ptr.add(range.start) },
             device_ptr: chunk.device_ptr + range.start as u64,
             len,
@@ -82,7 +86,7 @@ impl HostPinnedMemoryPool {
         Ok(allocation)
     }
 
-    pub(crate) unsafe fn dealloc(&self, allocation: HostPinnedAllocation) -> Result<()> {
+    pub(crate) unsafe fn dealloc_raw(&self, allocation: RawHostPinnedAllocation) -> Result<()> {
         let mut inner = self.0.lock().unwrap();
 
         let chunk = inner
@@ -150,11 +154,11 @@ impl Drop for Chunk {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct HostPinnedAllocation {
+pub(crate) struct RawHostPinnedAllocation {
     pub host_ptr: NonNull<u8>,
     pub device_ptr: CUdeviceptr_v2,
     pub len: usize,
 }
 
-unsafe impl Send for HostPinnedAllocation {}
-unsafe impl Sync for HostPinnedAllocation {}
+unsafe impl Send for RawHostPinnedAllocation {}
+unsafe impl Sync for RawHostPinnedAllocation {}

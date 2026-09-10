@@ -22,7 +22,7 @@ use cudarc::driver::sys::{
 };
 
 use crate::{
-    device_memory_pool::DeviceMemoryPool,
+    device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
     error::Result,
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
     stream::Stream,
@@ -69,8 +69,11 @@ impl Device {
         Stream::new(self)
     }
 
-    pub fn create_device_memory_pool(&self) -> Result<DeviceMemoryPool> {
-        DeviceMemoryPool::new(self)
+    pub fn create_device_memory_pool(
+        &self,
+        options: DeviceMemoryPoolOptions,
+    ) -> Result<DeviceMemoryPool> {
+        DeviceMemoryPool::new(options, self)
     }
 
     pub fn create_host_pinned_memory_pool(

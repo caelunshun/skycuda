@@ -4,10 +4,7 @@ use cudarc::driver::sys::{
     CUdeviceptr_v2, cuMemAllocFromPoolAsync, cuMemFreeAsync, cuMemsetD8Async,
 };
 
-use crate::{
-    device::Device, device_memory_pool::DeviceMemoryPool, error::Result,
-    stream::Stream,
-};
+use crate::{device::Device, device_memory_pool::DeviceMemoryPool, error::Result, stream::Stream};
 
 /// Raw, untyped wrapper over a device-local memory allocation.
 /// This type of memory is only accessible to the GPU.
@@ -52,9 +49,14 @@ impl DeviceMemory {
             }),
         })
     }
+    
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn mem_pool(&self) -> &DeviceMemoryPool {
@@ -107,7 +109,7 @@ impl DeviceVisibleMemory for DeviceMemory {
 
         let mut state = self.state.lock().unwrap();
 
-        if stream != &state.last_written_stream && !state.reading_by_streams.contains(&stream) {
+        if stream != &state.last_written_stream && !state.reading_by_streams.contains(stream) {
             let event = state.last_written_stream.record_event()?;
             stream.wait_on_event(&event)?;
             state.reading_by_streams.push(stream.clone());
@@ -126,7 +128,7 @@ impl DeviceVisibleMemoryMut for DeviceMemory {
 
         if state.reading_by_streams.is_empty() {
             if stream != &state.last_written_stream {
-                let event =   state.last_written_stream.record_event()?;
+                let event = state.last_written_stream.record_event()?;
                 stream.wait_on_event(&event)?;
             }
         } else {
@@ -178,6 +180,10 @@ pub trait DeviceVisibleMemory {
         Self: 'a;
 
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Introduces synchronization to ensure that read-only access to the memory on the given
     /// stream will not cause data races, by waiting on any previous (in program order) write accesses.

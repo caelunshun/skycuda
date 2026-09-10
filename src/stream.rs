@@ -4,16 +4,24 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use bytemuck::Pod;
 use cudarc::driver::sys::{
     CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
     CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS},
     CUstream,
     CUstream_flags::CU_STREAM_NON_BLOCKING,
-    cuEventRecord, cuStreamCreate, cuStreamDestroy_v2, cuStreamQuery, cuStreamSynchronize,
-    cuStreamWaitEvent,
+    cuEventRecord, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
+    cuStreamCreate, cuStreamDestroy_v2, cuStreamQuery, cuStreamSynchronize, cuStreamWaitEvent,
 };
 
-use crate::{device::Device, error::Result, event::Event};
+use crate::{
+    device::Device,
+    device_memory::{
+        DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
+    },
+    error::Result,
+    event::Event,
+};
 
 #[derive(Debug, Clone)]
 pub struct Stream(Arc<Inner>);
@@ -51,6 +59,72 @@ impl Stream {
             )
             .result()?;
         }
+        Ok(())
+    }
+
+    /// Requires that the size of `T` divides the memory size
+    /// and is one of 1, 2, 4.
+    pub fn fill<T: Pod>(&self, memory: &mut impl DeviceVisibleMemoryMut, value: T) -> Result<()> {
+        const {
+            assert!(matches!(size_of::<T>(), 1 | 2 | 4));
+        }
+
+        assert!(memory.len().is_multiple_of(size_of::<T>()));
+        let num_elements = memory.len() / size_of::<T>();
+
+        let mut guard = memory.access_mut_on(self)?;
+        unsafe {
+            match size_of::<T>() {
+                1 => {
+                    cuMemsetD8Async(
+                        guard.ptr(),
+                        bytemuck::cast(value),
+                        num_elements,
+                        self.cu_stream(),
+                    )
+                    .result()?;
+                }
+                2 => {
+                    cuMemsetD16Async(
+                        guard.ptr(),
+                        bytemuck::cast(value),
+                        num_elements,
+                        self.cu_stream(),
+                    )
+                    .result()?;
+                }
+                4 => {
+                    cuMemsetD32Async(
+                        guard.ptr(),
+                        bytemuck::cast(value),
+                        num_elements,
+                        self.cu_stream(),
+                    )
+                    .result()?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires that source and destination memories have the same length.
+    pub fn copy(
+        &self,
+        src: &impl DeviceVisibleMemory,
+        dst: &mut impl DeviceVisibleMemoryMut,
+    ) -> Result<()> {
+        let len = src.len();
+        assert_eq!(dst.len(), len);
+
+        let src_guard = src.access_on(self)?;
+        let mut dst_guard = dst.access_mut_on(self)?;
+
+        unsafe {
+            cuMemcpyDtoDAsync_v2(dst_guard.ptr(), src_guard.ptr(), len, self.cu_stream())
+                .result()?;
+        }
+
         Ok(())
     }
 
