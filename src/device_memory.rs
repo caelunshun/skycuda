@@ -1,10 +1,16 @@
-use std::sync::Mutex;
+use std::{ops::RangeBounds, sync::Mutex};
 
 use cudarc::driver::sys::{
     CUdeviceptr_v2, cuMemAllocFromPoolAsync, cuMemFreeAsync, cuMemsetD8Async,
 };
 
-use crate::{device::Device, device_memory_pool::DeviceMemoryPool, error::Result, stream::Stream};
+use crate::{
+    device::Device,
+    device_memory_pool::DeviceMemoryPool,
+    error::Result,
+    memory_slice::{MemorySlice, MemorySliceMut},
+    stream::Stream,
+};
 
 /// Raw, untyped wrapper over a device-local memory allocation.
 /// This type of memory is only accessible to the GPU.
@@ -49,7 +55,16 @@ impl DeviceMemory {
             }),
         })
     }
-    
+
+    #[must_use]
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> MemorySlice<&'_ Self> {
+        MemorySlice::new(self, range)
+    }
+
+    #[must_use]
+    pub fn slice_mut(&mut self, range: impl RangeBounds<usize>) -> MemorySliceMut<&'_ mut Self> {
+        MemorySliceMut::new(self, range)
+    }
 
     pub fn len(&self) -> usize {
         self.len
@@ -190,6 +205,42 @@ pub trait DeviceVisibleMemory {
     fn access_on<'a>(&'a self, stream: &'a Stream) -> Result<Self::Guard<'a>>;
 }
 
+impl<'a, T> DeviceVisibleMemory for &'a T
+where
+    T: DeviceVisibleMemory,
+{
+    type Guard<'g>
+        = T::Guard<'g>
+    where
+        'a: 'g;
+
+    fn len(&self) -> usize {
+        T::len(self)
+    }
+
+    fn access_on<'b>(&'b self, stream: &'b Stream) -> Result<Self::Guard<'b>> {
+        T::access_on(self, stream)
+    }
+}
+
+impl<'a, T> DeviceVisibleMemory for &'a mut T
+where
+    T: DeviceVisibleMemory,
+{
+    type Guard<'g>
+        = T::Guard<'g>
+    where
+        'a: 'g;
+
+    fn len(&self) -> usize {
+        T::len(self)
+    }
+
+    fn access_on<'b>(&'b self, stream: &'b Stream) -> Result<Self::Guard<'b>> {
+        T::access_on(self, stream)
+    }
+}
+
 pub trait DeviceVisibleMemoryMut: DeviceVisibleMemory {
     type GuardMut<'a>: DevicePtrGuardMut<'a>
     where
@@ -199,6 +250,20 @@ pub trait DeviceVisibleMemoryMut: DeviceVisibleMemory {
     /// memory on the given stream will not cause data races, by waiting on any previous (in program
     /// order) read accesses.
     fn access_mut_on<'a>(&'a mut self, stream: &'a Stream) -> Result<Self::GuardMut<'a>>;
+}
+
+impl<'a, T> DeviceVisibleMemoryMut for &'a mut T
+where
+    T: DeviceVisibleMemoryMut,
+{
+    type GuardMut<'g>
+        = T::GuardMut<'g>
+    where
+        'a: 'g;
+
+    fn access_mut_on<'b>(&'b mut self, stream: &'b Stream) -> Result<Self::GuardMut<'b>> {
+        T::access_mut_on(self, stream)
+    }
 }
 
 pub trait DevicePtrGuard<'a> {

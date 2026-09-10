@@ -1,5 +1,6 @@
 use std::{
     mem::MaybeUninit,
+    ops::RangeBounds,
     slice,
     sync::{Arc, Mutex, OnceLock},
 };
@@ -13,6 +14,7 @@ use crate::{
     error::Result,
     event::Event,
     host_pinned_memory_pool::{HostPinnedMemoryPool, RawHostPinnedAllocation},
+    memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
 };
 
@@ -105,6 +107,16 @@ impl HostPinnedMemory {
                 self.0.allocation.len,
             ))
         }
+    }
+
+    #[must_use]
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> MemorySlice<&'_ Self> {
+        MemorySlice::new(self, range)
+    }
+
+    #[must_use]
+    pub fn slice_mut(&mut self, range: impl RangeBounds<usize>) -> MemorySliceMut<&'_ mut Self> {
+        MemorySliceMut::new(self, range)
     }
 }
 
