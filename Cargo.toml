@@ -10,6 +10,8 @@ cudarc = { version = "0.19", default-features = false, features = [
     "driver",
     "std",
 ] }
-thiserror = "2"
-bytemuck = "1"
-range-alloc = "0.1"
+thiserror = "2.0"
+bytemuck = "1.25"
+range-alloc = "0.1.5"
+bumpalo = "3.20"
+half = { version = "2.7", features = ["bytemuck"] }

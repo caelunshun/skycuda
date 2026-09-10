@@ -21,6 +21,8 @@ use crate::{
     },
     error::Result,
     event::Event,
+    function::Function,
+    launch::LaunchBuilder,
 };
 
 #[derive(Debug, Clone)]
@@ -126,6 +128,10 @@ impl Stream {
         }
 
         Ok(())
+    }
+
+    pub fn launch_builder<'a>(&'a self, function: &'a Function) -> LaunchBuilder<'a> {
+        LaunchBuilder::new(function, self)
     }
 
     /// Blocks the current thread on waiting for all operations

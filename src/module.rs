@@ -2,7 +2,7 @@ use std::{ptr, sync::Arc};
 
 use cudarc::driver::sys::{CUmodule, cuModuleLoadData};
 
-use crate::{device::Device, error::Result};
+use crate::{device::Device, error::Result, function::Function};
 
 #[derive(Debug, Clone)]
 pub struct Module(Arc<Inner>);
@@ -22,6 +22,10 @@ impl Module {
             device: device.clone(),
             cu_module,
         })))
+    }
+
+    pub fn get_function(&self, name: &str) -> Result<Function> {
+        Function::new(name, self)
     }
 
     pub fn cu_module(&self) -> CUmodule {

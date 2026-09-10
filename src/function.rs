@@ -1,6 +1,8 @@
 use std::{ffi::CString, ptr, sync::Arc};
 
-use cudarc::driver::sys::{CUfunction, cuFuncLoad, cuModuleGetFunction};
+use cudarc::driver::sys::{
+    CUfunction, cuFuncGetParamCount, cuFuncGetParamInfo, cuFuncLoad, cuModuleGetFunction,
+};
 
 use crate::{device::Device, error::Result, module::Module};
 
@@ -22,9 +24,27 @@ impl Function {
             cuFuncLoad(cu_function).result()?;
         }
 
+        let mut param_count = 0;
+        unsafe {
+            cuFuncGetParamCount(cu_function, &mut param_count).result()?;
+        }
+
+        let mut param_sizes = Vec::new();
+        for param_idx in 0..param_count {
+            let mut param_size = 0;
+            let mut param_offset = 0;
+            unsafe {
+                cuFuncGetParamInfo(cu_function, param_idx, &mut param_offset, &mut param_size)
+                    .result()?;
+            }
+            assert!(param_size > 0);
+            param_sizes.push(param_size);
+        }
+
         Ok(Self(Arc::new(Inner {
             module: module.clone(),
             cu_function,
+            param_sizes,
         })))
     }
 
@@ -39,12 +59,21 @@ impl Function {
     pub fn cu_function(&self) -> CUfunction {
         self.0.cu_function
     }
+
+    pub fn num_params(&self) -> usize {
+        self.param_sizes().len()
+    }
+
+    pub fn param_sizes(&self) -> &[usize] {
+        &self.0.param_sizes
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
     module: Module,
     cu_function: CUfunction,
+    param_sizes: Vec<usize>,
 }
 
 unsafe impl Send for Inner {}

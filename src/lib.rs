@@ -11,3 +11,4 @@ pub mod host_pinned_memory_pool;
 pub mod memory_slice;
 pub mod module;
 pub mod stream;
+pub mod launch;
