@@ -11,19 +11,21 @@ use range_alloc::RangeAllocator;
 use crate::{device::Device, error::Result};
 
 #[derive(Debug, Clone)]
-pub struct HostPinnedMemoryPool(Arc<Mutex<Inner>>);
+pub struct HostPinnedMemoryPool(Arc<Mutex<Inner>>, Device);
 
 impl HostPinnedMemoryPool {
     pub const GUARANTEED_ALIGNMENT: usize = 128;
     const MIN_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
     pub(crate) fn new(options: HostPinnedMemoryPoolOptions, device: &Device) -> Result<Self> {
-        Ok(Self(Arc::new(Mutex::new(Inner {
-            device: device.clone(),
-            options,
-            chunks: Vec::new(),
-            free_bytes: 0,
-        }))))
+        Ok((Self(
+            Arc::new(Mutex::new(Inner {
+                options,
+                chunks: Vec::new(),
+                free_bytes: 0,
+            })),
+            device.clone(),
+        )))
     }
 
     pub(crate) unsafe fn alloc(&self, len: usize) -> Result<HostPinnedAllocation> {
@@ -110,11 +112,14 @@ impl HostPinnedMemoryPool {
 
         Ok(())
     }
+
+    pub fn device(&self) -> &Device {
+        &self.1
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
-    device: Device,
     options: HostPinnedMemoryPoolOptions,
     chunks: Vec<Chunk>,
     free_bytes: usize,
@@ -133,6 +138,9 @@ struct Chunk {
     allocator: RangeAllocator<usize>,
 }
 
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
+
 impl Drop for Chunk {
     fn drop(&mut self) {
         unsafe {
@@ -141,9 +149,12 @@ impl Drop for Chunk {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) struct HostPinnedAllocation {
     pub host_ptr: NonNull<u8>,
     pub device_ptr: CUdeviceptr_v2,
     pub len: usize,
 }
+
+unsafe impl Send for HostPinnedAllocation {}
+unsafe impl Sync for HostPinnedAllocation {}
