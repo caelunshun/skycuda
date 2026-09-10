@@ -10,8 +10,7 @@ use half::{bf16, f16};
 
 use crate::{
     device_memory::{
-        DeviceMemory, DeviceMemoryGuard, DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory,
-        DeviceVisibleMemoryMut,
+        DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
     },
     error::Result,
     function::Function,
