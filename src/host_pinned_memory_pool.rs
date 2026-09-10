@@ -54,6 +54,7 @@ impl HostPinnedMemoryPool {
         let new_chunk_size = len.max(Self::MIN_CHUNK_SIZE).next_power_of_two();
 
         let mut host_ptr = ptr::null_mut();
+        self.device().set_as_current()?;
         unsafe {
             cuMemAllocHost_v2(&mut host_ptr, new_chunk_size).result()?;
         }
@@ -66,7 +67,7 @@ impl HostPinnedMemoryPool {
         let mut chunk = Chunk {
             host_ptr: NonNull::new(host_ptr.cast()).unwrap(),
             device_ptr,
-            len,
+            len: new_chunk_size,
             allocator: RangeAllocator::new(0..new_chunk_size),
         };
         let range = chunk

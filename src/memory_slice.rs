@@ -23,12 +23,13 @@ where
             std::ops::Bound::Excluded(x) => *x + 1,
             std::ops::Bound::Unbounded => 0,
         };
-        assert!(offset < memory.len());
+        assert!(offset <= memory.len());
         let end = match range.end_bound() {
             std::ops::Bound::Included(x) => *x + 1,
             std::ops::Bound::Excluded(x) => *x,
             std::ops::Bound::Unbounded => memory.len(),
         };
+        assert!(end <= memory.len());
         let len = end.checked_sub(offset).unwrap();
 
         Self {
@@ -79,7 +80,7 @@ impl<T> MemorySliceMut<T>
 where
     T: DeviceVisibleMemoryMut,
 {
-    pub(crate) fn new(memory: T, range: impl RangeBounds<usize>) -> Self {
+    pub fn new(memory: T, range: impl RangeBounds<usize>) -> Self {
         let offset = match range.start_bound() {
             std::ops::Bound::Included(x) => *x,
             std::ops::Bound::Excluded(x) => *x + 1,

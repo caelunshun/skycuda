@@ -10,8 +10,8 @@ use cudarc::driver::sys::{
     CUresult::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS},
     CUstream,
     CUstream_flags::CU_STREAM_NON_BLOCKING,
-    cuEventRecord, cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async,
-    cuStreamCreate, cuStreamDestroy_v2, cuStreamQuery, cuStreamSynchronize, cuStreamWaitEvent,
+    cuMemcpyDtoDAsync_v2, cuMemsetD8Async, cuMemsetD16Async, cuMemsetD32Async, cuStreamCreate,
+    cuStreamDestroy_v2, cuStreamQuery, cuStreamSynchronize, cuStreamWaitEvent,
 };
 
 use crate::{
@@ -37,16 +37,13 @@ impl Stream {
         Ok(Self(Arc::new(Inner {
             device: device.clone(),
             cu_stream,
-            recorded_events: Mutex::new(Vec::new()),
+            events_observed: Mutex::new(Vec::new()),
         })))
     }
 
     pub fn record_event(&self) -> Result<Event> {
-        let event = Event::new(self.device())?;
-        unsafe {
-            cuEventRecord(event.cu_event(), self.0.cu_stream).result()?;
-        }
-        self.0.recorded_events.lock().unwrap().push(event.clone());
+        let event = Event::record(self)?;
+        self.0.events_observed.lock().unwrap().push(event.clone());
         Ok(event)
     }
 
@@ -59,11 +56,14 @@ impl Stream {
             )
             .result()?;
         }
+
+        self.0.events_observed.lock().unwrap().push(event.clone());
+
         Ok(())
     }
 
     /// Requires that the size of `T` divides the memory size
-    /// and is one of 1, 2, 4.
+    /// and is either 1, 2, or 4.
     pub fn fill<T: Pod>(&self, memory: &mut impl DeviceVisibleMemoryMut, value: T) -> Result<()> {
         const {
             assert!(matches!(size_of::<T>(), 1 | 2 | 4));
@@ -163,10 +163,26 @@ impl Stream {
     }
 
     pub(crate) fn notify_completion_observed(&self) -> Result<()> {
-        let events = mem::take(&mut *self.0.recorded_events.lock().unwrap());
+        let events = mem::take(&mut *self.0.events_observed.lock().unwrap());
         for event in events {
             event.notify_completion_observed()?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn notify_completion_observed_up_to(&self, event: &Event) -> Result<()> {
+        let mut events = self.0.events_observed.lock().unwrap();
+        let Some(i) = events.iter().position(|e| e == event) else {
+            return Ok(());
+        };
+
+        let completed_events = events.drain(..=i).collect::<Vec<_>>();
+        drop(events);
+
+        for event in completed_events {
+            event.notify_completion_observed()?;
+        }
+
         Ok(())
     }
 }
@@ -183,7 +199,7 @@ impl Eq for Stream {}
 struct Inner {
     device: Device,
     cu_stream: CUstream,
-    recorded_events: Mutex<Vec<Event>>,
+    events_observed: Mutex<Vec<Event>>,
 }
 
 impl Drop for Inner {

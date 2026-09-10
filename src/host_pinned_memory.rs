@@ -138,10 +138,19 @@ impl Drop for HostPinnedMemory {
                 });
             }
             State::Shared {
-                reader_done_events, ..
+                prev_writer_done_event,
+                reader_done_events,
+                ..
             } => {
                 // Need to keep Inner alive until
                 // device is done using it.
+                if let Some(writer_done_event) = prev_writer_done_event {
+                    let inner = self.0.clone();
+                    writer_done_event.on_completion_observed(move || {
+                        drop(inner);
+                        Ok(())
+                    });
+                }
                 for done_event in reader_done_events {
                     let inner: Arc<Inner> = self.0.clone();
                     done_event.wait().on_completion_observed(move || {
@@ -180,11 +189,18 @@ impl DeviceVisibleMemory for HostPinnedMemory {
                 writer_stream,
             } => {
                 if writer_stream != stream {
-                    stream.wait_on_event(done_event.wait())?;
-                    *writer_stream = stream.clone();
+                    let done_event = Arc::new(OnceLock::<Event>::new());
+                    *state = State::Shared {
+                        prev_writer_stream: Some(writer_stream.clone()),
+                        prev_writer_done_event: Some(done_event.wait().clone()),
+                        reader_done_events: vec![done_event.clone()],
+                        reader_streams: vec![stream.clone()],
+                    };
+                    done_event
+                } else {
+                    *done_event = Arc::new(OnceLock::new());
+                    done_event.clone()
                 }
-                *done_event = Arc::new(OnceLock::new());
-                done_event.clone()
             }
             State::Shared {
                 prev_writer_stream,

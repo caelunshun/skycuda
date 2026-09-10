@@ -1,24 +1,28 @@
 use std::{
     ptr,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use cudarc::driver::sys::{
-    CUcontext,
-    CUctx_flags::CU_CTX_MAP_HOST,
-    CUctxCreateParams_st,
-    CUdevice_attribute::{
-        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-        CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+use cudarc::driver::{
+    DriverError,
+    sys::{
+        CUcontext,
+        CUctx_flags::CU_CTX_MAP_HOST,
+        CUctxCreateParams_st,
+        CUdevice_attribute::{
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        },
+        CUevent,
+        CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
+        cuEventDestroy_v2,
     },
-    CUevent,
-    CUevent_flags::CU_EVENT_DISABLE_TIMING,
-    cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
-    cuEventDestroy_v2,
 };
 
 use crate::{
@@ -33,6 +37,10 @@ pub struct Device(Arc<Inner>);
 
 impl Device {
     pub fn from_index(ordinal: u32) -> Result<Self> {
+        static DRIVER_INIT: LazyLock<Result<(), DriverError>> =
+            LazyLock::new(cudarc::driver::result::init);
+        (*DRIVER_INIT)?;
+
         let ordinal = i32::try_from(ordinal)?;
 
         let mut cu_context = ptr::null_mut();
@@ -127,6 +135,7 @@ impl Device {
             Some(event) => Ok(event),
             None => {
                 let mut event = ptr::null_mut();
+                self.set_as_current()?;
                 unsafe {
                     cuEventCreate(&mut event, CU_EVENT_DISABLE_TIMING as u32).result()?;
                 }
