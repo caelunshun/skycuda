@@ -1,0 +1,3 @@
+[submodule "skycuda-cudnn-sys/cudnn-frontend"]
+	path = skycuda-cudnn-sys/cudnn-frontend
+	url = https://github.com/NVIDIA/cudnn-frontend

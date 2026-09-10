@@ -3,6 +3,9 @@ name = "skycuda"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "skycuda-cudnn", "skycuda-cudnn-sys"]
+
 [dependencies]
 cudarc = { version = "0.19", default-features = false, features = [
     "cuda-version-from-build-system",
