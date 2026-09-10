@@ -6,6 +6,8 @@ pub enum Error {
     CudaDriver(#[from] cudarc::driver::result::DriverError),
     #[error(transparent)]
     IntConversion(#[from] TryFromIntError),
+    #[error(transparent)]
+    StringNul(#[from] std::ffi::NulError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

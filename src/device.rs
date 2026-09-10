@@ -1,4 +1,5 @@
 use std::{
+    ffi::CString,
     ptr,
     sync::{
         Arc, LazyLock, Mutex,
@@ -29,6 +30,7 @@ use crate::{
     device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
     error::Result,
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
+    module::Module,
     stream::Stream,
 };
 
@@ -89,6 +91,19 @@ impl Device {
         options: HostPinnedMemoryPoolOptions,
     ) -> Result<HostPinnedMemoryPool> {
         HostPinnedMemoryPool::new(options, self)
+    }
+
+    pub fn load_module_ptx(&self, ptx: &str) -> Result<Module> {
+        let null_terminated = CString::new(ptx)?;
+
+        unsafe { Module::new(null_terminated.as_bytes_with_nul(), self) }
+    }
+
+    /// # Safety
+    /// The cubin data must be well-formed (i.e. exactly
+    /// as emitted by nvcc).
+    pub unsafe fn load_module_cubin(&self, cubin: &[u8]) -> Result<Module> {
+        unsafe { Module::new(cubin, self) }
     }
 
     pub fn ordinal(&self) -> u32 {
