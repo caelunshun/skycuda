@@ -1,5 +1,5 @@
 [package]
-name = "cudnn-frontend-sys"
+name = "skycuda-cudnn-sys"
 version = "0.1.0"
 edition = "2024"
 

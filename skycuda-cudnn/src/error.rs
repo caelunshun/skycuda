@@ -1,9 +1,7 @@
 //! Error type mapping the shim's status codes + thread-local message.
 
-use std::ffi::CStr;
-use std::fmt;
-
-use cudnn_frontend_sys as sys;
+use skycuda_cudnn_sys as sys;
+use std::{ffi::CStr, fmt};
 
 /// Error codes mirroring `cudnn_frontend::error_code_t` (plus a shim-internal
 /// `ShimException` for C++ exceptions that escaped the frontend).
@@ -59,6 +57,15 @@ impl ErrorCode {
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
+}
+
+impl From<skycuda::error::Error> for Error {
+    fn from(value: skycuda::error::Error) -> Self {
+        Self {
+            code: ErrorCode::CudaApiFailed,
+            message: value.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Error {

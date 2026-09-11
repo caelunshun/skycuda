@@ -7,7 +7,7 @@ edition = "2024"
 members = [".", "skycuda-cudnn", "skycuda-cudnn-sys"]
 
 [dependencies]
-cudarc = { version = "0.19", default-features = false, features = [
+cudarc = { git = "https://github.com/caelunshun/cudarc", branch = "cuda-13-4", default-features = false, features = [
     "cuda-version-from-build-system",
     "dynamic-loading",
     "driver",

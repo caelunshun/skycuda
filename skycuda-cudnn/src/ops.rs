@@ -1,6 +1,6 @@
 use std::ptr;
 
-use cudnn_frontend_sys as sys;
+use skycuda_cudnn_sys as sys;
 
 use crate::error::check;
 use crate::{

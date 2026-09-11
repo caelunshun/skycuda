@@ -1,18 +1,27 @@
-use std::sync::Arc;
-use std::{ffi::CString, sync::Once};
-use std::{mem, ptr};
-
-use cudarc::driver::CudaStream;
-use cudarc::driver::sys::CUdeviceptr;
-use cudnn_frontend_sys as sys;
+use skycuda_cudnn_sys as sys;
+use skycuda::{
+    cudarc::driver::sys::CUdeviceptr_v2,
+    device_memory::{
+        DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
+    },
+    stream::Stream,
+};
+use std::{
+    ffi::CString,
+    mem, ptr,
+    sync::{
+        Arc, Mutex, Once,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 mod enums;
 mod error;
-
+mod ops;
 pub use enums::*;
-pub use error::{Error, ErrorCode, Result};
-
 use error::check;
+pub use error::{Error, ErrorCode, Result};
+pub use ops::*;
 
 pub fn load_cudnn_library(path: Option<&str>) -> Result<()> {
     static LOADED: Once = Once::new();
@@ -29,39 +38,39 @@ pub fn backend_version() -> i64 {
     unsafe { sys::cudnn_fe_backend_version() }
 }
 
-pub struct CudnnHandle {
-    stream: Arc<CudaStream>,
+#[derive(Debug, Clone)]
+pub struct CudnnHandle(Arc<Mutex<HandleInner>>, Stream);
+
+#[derive(Debug, Clone)]
+struct HandleInner {
     raw: *mut sys::cudnnFeHandle,
 }
 
 impl CudnnHandle {
-    pub fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+    pub fn new(stream: &Stream) -> Result<Self> {
         let mut raw = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_handle_create(stream.cu_stream().cast(), &mut raw) })?;
-        Ok(CudnnHandle {
-            raw,
-            stream: stream.clone(),
-        })
+        Ok(CudnnHandle(
+            Arc::new(Mutex::new(HandleInner { raw })),
+            stream.clone(),
+        ))
     }
 
-    pub fn set_stream(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_handle_set_stream(self.raw, stream.cu_stream().cast()) })?;
-        self.stream = stream.clone();
-        Ok(())
-    }
-
-    pub(crate) fn as_ptr(&self) -> *mut sys::cudnnFeHandle {
-        self.raw
+    pub fn with_ptr<R>(&self, callback: impl FnOnce(*mut sys::cudnnFeHandle) -> R) -> R {
+        let guard = self.0.lock().unwrap();
+        let res = callback(guard.raw);
+        drop(guard);
+        res
     }
 }
 
-impl Drop for CudnnHandle {
+impl Drop for HandleInner {
     fn drop(&mut self) {
         unsafe { sys::cudnn_fe_handle_destroy(self.raw) };
     }
 }
 
-unsafe impl Send for CudnnHandle {}
+unsafe impl Send for HandleInner {}
 
 /// Abstract tensor in a graph.
 #[derive(Clone, Copy)]
@@ -290,7 +299,9 @@ impl<'h> GraphBuilder<'h> {
     }
 
     pub fn build_operation_graph(&self) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_graph_build_operation_graph(self.raw, self.handle.as_ptr()) })
+        self.handle.with_ptr(|handle| {
+            check(unsafe { sys::cudnn_fe_graph_build_operation_graph(self.raw, handle) })
+        })
     }
 
     pub fn create_execution_plans(&self, modes: &[HeurMode]) -> Result<()> {
@@ -301,12 +312,14 @@ impl<'h> GraphBuilder<'h> {
     }
 
     pub fn check_support(&self) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_graph_check_support(self.raw, self.handle.as_ptr()) })
+        self.handle.with_ptr(|handle| {
+            check(unsafe { sys::cudnn_fe_graph_check_support(self.raw, handle) })
+        })
     }
 
     pub fn build_plans(&self, policy: BuildPlanPolicy) -> Result<()> {
-        check(unsafe {
-            sys::cudnn_fe_graph_build_plans(self.raw, self.handle.as_ptr(), policy.to_ffi())
+        self.handle.with_ptr(|handle| {
+            check(unsafe { sys::cudnn_fe_graph_build_plans(self.raw, handle, policy.to_ffi()) })
         })
     }
 
@@ -348,12 +361,20 @@ impl<'h> GraphBuilder<'h> {
 
     pub fn build(self, modes: &[HeurMode]) -> Result<BuiltGraph> {
         let raw: Vec<sys::cudnnFeHeurMode> = modes.iter().map(|m| m.to_ffi()).collect();
-        check(unsafe {
-            sys::cudnn_fe_graph_build(self.raw, (*self.handle).as_ptr(), raw.as_ptr(), raw.len())
+        self.handle.with_ptr(|handle| {
+            check(unsafe { sys::cudnn_fe_graph_build(self.raw, handle, raw.as_ptr(), raw.len()) })
         })?;
+
         let raw = self.raw;
+        let builder_handle = self.handle.clone();
         mem::forget(self);
-        Ok(BuiltGraph { raw })
+
+        static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(0);
+        Ok(BuiltGraph {
+            raw,
+            builder_handle,
+            id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 }
 
@@ -364,6 +385,9 @@ impl Drop for GraphBuilder<'_> {
 }
 
 pub struct BuiltGraph {
+    id: u64,
+    #[expect(unused)]
+    builder_handle: CudnnHandle,
     raw: *mut sys::cudnnFeGraph,
 }
 
@@ -374,47 +398,30 @@ impl BuiltGraph {
         Ok(out)
     }
 
-    /// # Safety
-    /// All provided device pointers must match cuDNN expectations.
-    pub unsafe fn execute(
-        &self,
-        handle: &CudnnHandle,
-        variant_pack: &[(i64, CUdeviceptr)],
-        workspace: CUdeviceptr,
-    ) -> Result<()> {
-        let (uids, ptrs) = split_varpack(variant_pack);
-        check(unsafe {
-            sys::cudnn_fe_graph_execute(
-                self.raw,
-                handle.as_ptr(),
-                uids.as_ptr(),
-                ptrs.as_ptr(),
-                uids.len(),
-                workspace,
-            )
-        })
+    pub fn new_variant_pack<'a>(&'a self, handle: &'a CudnnHandle) -> VariantPack<'a> {
+        VariantPack::new(self.id, handle)
     }
 
     /// # Safety
     /// All provided device pointers must match cuDNN expectations.
-    pub unsafe fn execute_plan_at_index(
+    pub unsafe fn execute(
         &self,
-        handle: &CudnnHandle,
-        variant_pack: &[(i64, CUdeviceptr)],
-        workspace: CUdeviceptr,
-        index: i64,
+        variant_pack: &VariantPack,
+        workspace: &mut impl DeviceVisibleMemoryMut,
     ) -> Result<()> {
-        let (uids, ptrs) = split_varpack(variant_pack);
-        check(unsafe {
-            sys::cudnn_fe_graph_execute_plan_at_index(
-                self.raw,
-                handle.as_ptr(),
-                uids.as_ptr(),
-                ptrs.as_ptr(),
-                uids.len(),
-                workspace,
-                index,
-            )
+        assert_eq!(variant_pack.graph_id, self.id);
+        let mut workspace_guard = workspace.access_mut_on(&variant_pack.handle.1)?;
+        variant_pack.handle.with_ptr(|handle| {
+            check(unsafe {
+                sys::cudnn_fe_graph_execute(
+                    self.raw,
+                    handle,
+                    variant_pack.entry_ids.as_ptr(),
+                    variant_pack.entry_ptrs.as_ptr(),
+                    variant_pack.entry_ids.len(),
+                    workspace_guard.ptr(),
+                )
+            })
         })
     }
 
@@ -437,12 +444,6 @@ impl Drop for BuiltGraph {
     }
 }
 
-fn split_varpack(vp: &[(i64, CUdeviceptr)]) -> (Vec<i64>, Vec<u64>) {
-    let uids = vp.iter().map(|(u, _)| *u).collect();
-    let ptrs = vp.iter().map(|(_, p)| *p).collect();
-    (uids, ptrs)
-}
-
 pub(crate) fn opt_ptr(t: Option<Tensor<'_, '_>>) -> *const sys::cudnnFeTensor {
     t.map_or(ptr::null(), |t| t.as_ptr())
 }
@@ -459,5 +460,55 @@ pub(crate) fn cstr(s: Option<&str>) -> (Option<CString>, *const std::os::raw::c_
     }
 }
 
-mod ops;
-pub use ops::*;
+pub struct VariantPack<'a> {
+    graph_id: u64,
+    handle: &'a CudnnHandle,
+    entry_ids: Vec<i64>,
+    entry_ptrs: Vec<CUdeviceptr_v2>,
+    entry_guards: Vec<Box<dyn Anything + 'a>>,
+}
+
+trait Anything {}
+impl<T> Anything for T {}
+
+impl<'a> VariantPack<'a> {
+    fn new(graph_id: u64, handle: &'a CudnnHandle) -> Self {
+        Self {
+            graph_id,
+            handle,
+            entry_ids: Vec::new(),
+            entry_ptrs: Vec::new(),
+            entry_guards: Vec::new(),
+        }
+    }
+
+    pub fn add(
+        &mut self,
+        id: i64,
+        memory: &'a impl DeviceVisibleMemory,
+    ) -> skycuda::error::Result<&mut Self> {
+        let guard = memory.access_on(&self.handle.1)?;
+        let ptr = unsafe { guard.ptr() };
+
+        self.entry_ids.push(id);
+        self.entry_ptrs.push(ptr);
+        self.entry_guards.push(Box::new(guard));
+
+        Ok(self)
+    }
+
+    pub fn add_mut(
+        &mut self,
+        id: i64,
+        memory: &'a mut impl DeviceVisibleMemoryMut,
+    ) -> skycuda::error::Result<&mut Self> {
+        let mut guard = memory.access_mut_on(&self.handle.1)?;
+        let ptr = unsafe { guard.ptr() };
+
+        self.entry_ids.push(id);
+        self.entry_ptrs.push(ptr);
+        self.entry_guards.push(Box::new(guard));
+
+        Ok(self)
+    }
+}

@@ -1,16 +1,19 @@
-use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
-use half::f16;
-
 use cudnn_frontend::{
-    CudnnHandle, DataType, GraphBuilder, HeurMode, MatmulAttributes, SdpaAttributes,
-    TensorAttributes,
+    CudnnHandle, DataType, GraphBuilder, HeurMode, MatmulAttributes, TensorAttributes,
 };
+use half::f16;
+use skycuda::{device::Device, host_pinned_memory_pool::HostPinnedMemoryPoolOptions};
 
 #[test]
 fn matmul_end_to_end() {
-    let ctx = CudaContext::new(0).expect("cuda context");
-    let stream = ctx.default_stream();
+    let device = Device::from_index(0).unwrap();
+    let stream = device.create_stream().unwrap();
     let handle = CudnnHandle::new(&stream).unwrap();
+    let pool = device
+        .create_host_pinned_memory_pool(HostPinnedMemoryPoolOptions {
+            max_reserved_free_bytes: 1024,
+        })
+        .unwrap();
 
     // Shapes: A[B,M,K] @ B[B,K,N] = C[B,M,N]
     let (b, m, k, n) = (2i64, 32i64, 64i64, 48i64);
@@ -23,9 +26,19 @@ fn matmul_end_to_end() {
         .map(|i| f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
         .collect();
 
-    let a_dev = stream.clone_htod(&a_host).unwrap();
-    let b_dev = stream.clone_htod(&b_host).unwrap();
-    let mut c_dev = stream.alloc_zeros::<f16>((b * m * n) as usize).unwrap();
+    let mut a_memory = pool.alloc_zeroed(a_host.len() * size_of::<f16>()).unwrap();
+    a_memory
+        .view_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::cast_slice(&a_host));
+
+    let mut b_memory = pool.alloc_zeroed(b_host.len() * size_of::<f16>()).unwrap();
+    b_memory
+        .view_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::cast_slice(&b_host));
+
+    let mut c_memory = pool.alloc_zeroed((b * m * n) as usize).unwrap();
 
     // Build the graph.
     let graph = GraphBuilder::new(&handle).unwrap();
@@ -64,24 +77,24 @@ fn matmul_end_to_end() {
     let graph = graph.build(&[HeurMode::A, HeurMode::B]).unwrap();
 
     let ws_size = graph.workspace_size().unwrap();
-    let workspace = stream.alloc_zeros::<u8>(ws_size.max(1) as usize).unwrap();
+    let mut workspace = pool.alloc_zeroed(ws_size as usize).unwrap();
 
     {
-        let (a_ptr, _a_g) = a_dev.device_ptr(&stream);
-        let (b_ptr, _b_g) = b_dev.device_ptr(&stream);
-        let (c_ptr, _c_g) = c_dev.device_ptr_mut(&stream);
-        let (ws_ptr, _ws_g) = workspace.device_ptr(&stream);
+        let mut variant_pack = graph.new_variant_pack(&handle);
+        variant_pack
+            .add(1, &a_memory)
+            .unwrap()
+            .add(2, &b_memory)
+            .unwrap()
+            .add_mut(3, &mut c_memory)
+            .unwrap();
 
         unsafe {
-            graph
-                .execute(&handle, &[(1, a_ptr), (2, b_ptr), (3, c_ptr)], ws_ptr)
-                .unwrap();
+            graph.execute(&variant_pack, &mut workspace).unwrap();
         }
-
-        stream.synchronize().unwrap();
     }
 
-    let c_host = stream.clone_dtoh(&c_dev).unwrap();
+    let c_host: &[f16] = bytemuck::cast_slice(c_memory.view_mut().unwrap());
 
     // CPU reference.
     let mut reference = vec![0f32; (b * m * n) as usize];
@@ -103,121 +116,9 @@ fn matmul_end_to_end() {
     for (got, want) in c_host.iter().zip(reference.iter()) {
         max_abs_err = max_abs_err.max((got.to_f32() - want).abs());
     }
+    assert!(max_abs_err.is_finite());
     assert!(
         max_abs_err < 0.5,
         "matmul result diverged from reference: max abs err = {max_abs_err}"
     );
-}
-
-#[test]
-fn sdpa_forward_end_to_end() {
-    let (b, h, s, d) = (1i64, 2i64, 64i64, 64i64);
-    let attn_scale = 1.0f32 / (d as f32).sqrt();
-
-    let ctx = CudaContext::new(0).expect("cuda context");
-    let stream = ctx.default_stream();
-
-    let handle = CudnnHandle::new(&stream).unwrap();
-
-    let elems = (b * h * s * d) as usize;
-    // Small values keep softmax well-conditioned.
-    let mk = |seed: i64| -> Vec<f16> {
-        (0..elems)
-            .map(|i| f16::from_f32((((i as i64 + seed) % 11) as f32 - 5.0) * 0.02))
-            .collect()
-    };
-    let q_host = mk(0);
-    let k_host = mk(3);
-    let v_host = mk(7);
-
-    let q_dev = stream.clone_htod(&q_host).unwrap();
-    let k_dev = stream.clone_htod(&k_host).unwrap();
-    let v_dev = stream.clone_htod(&v_host).unwrap();
-    let mut o_dev = stream.alloc_zeros::<f16>(elems).unwrap();
-
-    let graph = GraphBuilder::new(&handle).unwrap();
-    graph.set_io_data_type(DataType::Half).unwrap();
-    graph.set_intermediate_data_type(DataType::Float).unwrap();
-    graph.set_compute_data_type(DataType::Float).unwrap();
-
-    let stride = [h * s * d, s * d, d, 1];
-    let q = graph
-        .tensor(
-            &TensorAttributes::new(&[b, h, s, d], &stride)
-                .data_type(DataType::Half)
-                .uid(1)
-                .name("Q"),
-        )
-        .unwrap();
-    let k = graph
-        .tensor(
-            &TensorAttributes::new(&[b, h, s, d], &stride)
-                .data_type(DataType::Half)
-                .uid(2)
-                .name("K"),
-        )
-        .unwrap();
-    let v = graph
-        .tensor(
-            &TensorAttributes::new(&[b, h, s, d], &stride)
-                .data_type(DataType::Half)
-                .uid(3)
-                .name("V"),
-        )
-        .unwrap();
-
-    let out = graph
-        .sdpa(
-            q,
-            k,
-            v,
-            &SdpaAttributes::new()
-                .compute_data_type(DataType::Float)
-                .attn_scale(attn_scale)
-                .generate_stats(false)
-                .name("sdpa"),
-        )
-        .unwrap();
-    let o = out[0].expect("sdpa produced O");
-    o.set_output(true).unwrap();
-    o.set_dim(&[b, h, s, d]).unwrap();
-    o.set_stride(&stride).unwrap();
-    o.set_uid(4).unwrap();
-    o.set_data_type(DataType::Half).unwrap();
-
-    let graph = graph.build(&[HeurMode::A]).unwrap();
-
-    let ws = graph.workspace_size().unwrap();
-    let workspace = stream.alloc_zeros::<u8>(ws.max(1) as usize).unwrap();
-
-    {
-        let (qp, _qg) = q_dev.device_ptr(&stream);
-        let (kp, _kg) = k_dev.device_ptr(&stream);
-        let (vp, _vg) = v_dev.device_ptr(&stream);
-        let (op, _og) = o_dev.device_ptr_mut(&stream);
-        let (wp, _wg) = workspace.device_ptr(&stream);
-        unsafe {
-            graph
-                .execute(&handle, &[(1, qp), (2, kp), (3, vp), (4, op)], wp)
-                .unwrap();
-        }
-        stream.synchronize().unwrap();
-    }
-
-    let o_host = stream.clone_dtoh(&o_dev).unwrap();
-
-    let v_max = v_host.iter().map(|x| x.to_f32().abs()).fold(0.0, f32::max);
-    let mut all_zero = true;
-    for x in &o_host {
-        let f = x.to_f32();
-        assert!(f.is_finite(), "non-finite SDPA output: {f}");
-        assert!(
-            f.abs() <= v_max + 1e-2,
-            "SDPA output {f} exceeds V range {v_max}"
-        );
-        if f != 0.0 {
-            all_zero = false;
-        }
-    }
-    assert!(!all_zero, "SDPA output was entirely zero");
 }

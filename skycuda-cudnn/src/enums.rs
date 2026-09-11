@@ -27,8 +27,8 @@ ffi_enum! {
         NotSet = 0, Float = 1, Double = 2, Half = 3, Int8 = 4, Int32 = 5,
         Int8x4 = 6, Uint8 = 7, Uint8x4 = 8, Int8x32 = 9, Bfloat16 = 10,
         Int64 = 11, Boolean = 12, ByteBoolean = 13, Fp8E4m3 = 14, Fp8E5m2 = 15,
-        FastFloatForFp8 = 16, Fp8E8m0 = 17, Fp4E2m1 = 18, Int4 = 19,
-        ComplexFp32 = 20, ComplexFp64 = 21,
+        FastFloatForFp8 = 16, Fp8E8m0 = 17, Fp8E5m3 = 18, Fp4E2m1 = 19,
+        Int4 = 20, ComplexFp32 = 21, ComplexFp64 = 22,
     }
 }
 

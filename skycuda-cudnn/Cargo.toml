@@ -1,16 +1,12 @@
 [package]
-name = "cudnn-frontend"
+name = "skycuda-cudnn"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cudnn-frontend-sys = { path = "../skycuda-cudnn-sys" }
-cudarc = { version = "0.19", default-features = false, features = [
-    "cuda-version-from-build-system",
-    "dynamic-loading",
-    "driver",
-] }
+skycuda-cudnn-sys = { path = "../skycuda-cudnn-sys" }
+skycuda = { path = ".." }
+bytemuck = "1"
 
 [dev-dependencies]
-cudarc = { version = "0.19", features = ["f16", "dynamic-loading"] }
 half = "2"

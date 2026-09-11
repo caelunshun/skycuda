@@ -12,3 +12,5 @@ pub mod launch;
 pub mod memory_slice;
 pub mod module;
 pub mod stream;
+
+pub use cudarc;
