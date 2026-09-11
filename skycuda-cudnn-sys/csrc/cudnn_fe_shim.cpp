@@ -393,6 +393,47 @@ cudnn_fe_tensor_set_output(cudnnFeTensor* t, int32_t is_output) {
 }
 
 extern "C" int32_t
+cudnn_fe_tensor_get_data_type(const cudnnFeTensor* t, cudnnFeDataType* out) {
+    return run([&]() -> fe::error_t {
+        *out = static_cast<cudnnFeDataType>(reinterpret_cast<const Tensor_attributes*>(t)->get_data_type());
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_tensor_get_is_virtual(const cudnnFeTensor* t, int32_t* out) {
+    return run([&]() -> fe::error_t {
+        *out = reinterpret_cast<const Tensor_attributes*>(t)->get_is_virtual() ? 1 : 0;
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_tensor_get_is_pass_by_value(const cudnnFeTensor* t, int32_t* out) {
+    return run([&]() -> fe::error_t {
+        *out = reinterpret_cast<const Tensor_attributes*>(t)->get_is_pass_by_value() ? 1 : 0;
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_tensor_get_reordering(const cudnnFeTensor* t, cudnnFeTensorReordering* out) {
+    return run([&]() -> fe::error_t {
+        *out = static_cast<cudnnFeTensorReordering>(
+            reinterpret_cast<const Tensor_attributes*>(t)->get_reordering_type());
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_data_type_size_bits(cudnnFeDataType dt, int64_t* out) {
+    return run([&]() -> fe::error_t {
+        *out = static_cast<int64_t>(fe::detail::get_element_size_in_bits(DT(dt)));
+        return OK;
+    });
+}
+
+extern "C" int32_t
 cudnn_fe_tensor_set_data_type(cudnnFeTensor* t, cudnnFeDataType dt) {
     return run([&]() -> fe::error_t {
         reinterpret_cast<Tensor_attributes*>(t)->set_data_type(DT(dt));

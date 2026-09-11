@@ -15,11 +15,18 @@ macro_rules! ffi_enum {
             pub(crate) fn to_ffi(self) -> $ffi {
                 self as i32 as $ffi
             }
+            #[allow(dead_code)]
+            pub(crate) fn from_ffi(v: $ffi) -> Option<Self> {
+                match v as i32 {
+                    $($val => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
         }
     };
 }
 
-use cudnn_frontend_sys as sys;
+use skycuda_cudnn_sys as sys;
 
 ffi_enum! {
     /// Element data type (`DataType_t`).

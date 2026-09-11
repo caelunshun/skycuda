@@ -264,6 +264,12 @@ int32_t cudnn_fe_tensor_set_uid(cudnnFeTensor*, int64_t uid);
 int32_t cudnn_fe_tensor_get_dim(const cudnnFeTensor*, int64_t* out, size_t* len);
 int32_t cudnn_fe_tensor_get_stride(const cudnnFeTensor*, int64_t* out, size_t* len);
 int32_t cudnn_fe_tensor_set_output(cudnnFeTensor*, int32_t is_output);
+int32_t cudnn_fe_tensor_get_data_type(const cudnnFeTensor*, cudnnFeDataType* out);
+int32_t cudnn_fe_tensor_get_is_virtual(const cudnnFeTensor*, int32_t* out);
+int32_t cudnn_fe_tensor_get_is_pass_by_value(const cudnnFeTensor*, int32_t* out);
+int32_t cudnn_fe_tensor_get_reordering(const cudnnFeTensor*, cudnnFeTensorReordering* out);
+/* Element size in bits as known to cudnn_frontend; 0 if unknown. */
+int32_t cudnn_fe_data_type_size_bits(cudnnFeDataType, int64_t* out);
 int32_t cudnn_fe_tensor_set_data_type(cudnnFeTensor*, cudnnFeDataType);
 int32_t cudnn_fe_tensor_set_dim(cudnnFeTensor*, const int64_t* dim, size_t len);
 int32_t cudnn_fe_tensor_set_stride(cudnnFeTensor*, const int64_t* stride, size_t len);

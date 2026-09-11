@@ -1,4 +1,3 @@
-use skycuda_cudnn_sys as sys;
 use skycuda::{
     cudarc::driver::sys::CUdeviceptr_v2,
     device_memory::{
@@ -6,7 +5,10 @@ use skycuda::{
     },
     stream::Stream,
 };
+use skycuda_cudnn_sys as sys;
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::CString,
     mem, ptr,
     sync::{
@@ -72,6 +74,30 @@ impl Drop for HandleInner {
 
 unsafe impl Send for HandleInner {}
 
+/// Identifier binding a graph tensor to an allocation in a [`VariantPack`]
+/// (cuDNN's tensor "uid").
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TensorId(pub i64);
+
+impl TensorId {
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl From<i64> for TensorId {
+    fn from(id: i64) -> Self {
+        TensorId(id)
+    }
+}
+
+impl std::fmt::Display for TensorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Abstract tensor in a graph.
 #[derive(Clone, Copy)]
 pub struct Tensor<'g, 'h> {
@@ -80,10 +106,21 @@ pub struct Tensor<'g, 'h> {
 }
 
 impl<'g, 'h> Tensor<'g, 'h> {
-    pub(crate) unsafe fn from_raw(
+    /// Wraps a tensor that is read by the graph (created via `tensor`/`tensor_like`).
+    pub(crate) unsafe fn from_raw_input(
         raw: *mut sys::cudnnFeTensor,
         graph: &'g GraphBuilder<'h>,
     ) -> Self {
+        graph.tensors.borrow_mut().push((raw, false));
+        Tensor { raw, graph }
+    }
+
+    /// Wraps a tensor that is written by the graph (produced by an operation).
+    pub(crate) unsafe fn from_raw_output(
+        raw: *mut sys::cudnnFeTensor,
+        graph: &'g GraphBuilder<'h>,
+    ) -> Self {
+        graph.tensors.borrow_mut().push((raw, true));
         Tensor { raw, graph }
     }
 
@@ -91,54 +128,171 @@ impl<'g, 'h> Tensor<'g, 'h> {
         self.raw as *const _
     }
 
-    pub fn uid(&self) -> Result<i64> {
+    pub fn uid(&self) -> TensorId {
         let mut out = 0;
-        check(unsafe { sys::cudnn_fe_tensor_get_uid(self.as_ptr(), &mut out) })?;
-        Ok(out)
+        check(unsafe { sys::cudnn_fe_tensor_get_uid(self.as_ptr(), &mut out) }).unwrap();
+        TensorId(out)
     }
 
-    pub fn set_uid(&self, uid: i64) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_tensor_set_uid(self.raw, uid) })
+    pub fn set_uid(&self, uid: TensorId) {
+        check(unsafe { sys::cudnn_fe_tensor_set_uid(self.raw, uid.0) }).unwrap()
     }
 
-    pub fn set_output(&self, is_output: bool) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_tensor_set_output(self.raw, is_output as i32) })
+    pub fn set_output(&self, is_output: bool) {
+        check(unsafe { sys::cudnn_fe_tensor_set_output(self.raw, is_output as i32) }).unwrap()
     }
 
-    pub fn set_data_type(&self, dt: DataType) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_tensor_set_data_type(self.raw, dt.to_ffi()) })
+    pub fn set_data_type(&self, dt: DataType) {
+        check(unsafe { sys::cudnn_fe_tensor_set_data_type(self.raw, dt.to_ffi()) }).unwrap()
     }
 
-    pub fn set_dim(&self, dim: &[i64]) -> Result<()> {
-        check(unsafe { sys::cudnn_fe_tensor_set_dim(self.raw, dim.as_ptr(), dim.len()) })
+    pub fn set_dim(&self, dim: &[usize]) {
+        let dim = to_ffi_dims(dim);
+        check(unsafe { sys::cudnn_fe_tensor_set_dim(self.raw, dim.as_ptr(), dim.len()) }).unwrap()
     }
 
-    pub fn set_stride(&self, stride: &[i64]) -> Result<()> {
+    pub fn set_stride(&self, stride: &[usize]) {
+        let stride = to_ffi_dims(stride);
         check(unsafe { sys::cudnn_fe_tensor_set_stride(self.raw, stride.as_ptr(), stride.len()) })
+            .unwrap()
     }
 
     /// Reads the (possibly inferred) dimensions.
-    pub fn dim(&self) -> Result<Vec<i64>> {
-        read_i64_vec(|out, len| unsafe { sys::cudnn_fe_tensor_get_dim(self.as_ptr(), out, len) })
+    pub fn dim(&self) -> Vec<usize> {
+        from_ffi_dims(read_i64_vec(|out, len| unsafe {
+            sys::cudnn_fe_tensor_get_dim(self.as_ptr(), out, len)
+        }))
     }
 
     /// Reads the (possibly inferred) strides.
-    pub fn stride(&self) -> Result<Vec<i64>> {
-        read_i64_vec(|out, len| unsafe { sys::cudnn_fe_tensor_get_stride(self.as_ptr(), out, len) })
+    pub fn stride(&self) -> Vec<usize> {
+        from_ffi_dims(read_i64_vec(|out, len| unsafe {
+            sys::cudnn_fe_tensor_get_stride(self.as_ptr(), out, len)
+        }))
     }
 
     pub fn is_in_graph(&self, graph: &GraphBuilder) -> bool {
         ptr::eq(self.graph, graph)
     }
+
+    pub fn data_type(&self) -> DataType {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_tensor_get_data_type(self.as_ptr(), &mut out) }).unwrap();
+        DataType::from_ffi(out).expect("cuDNN returned an unknown data type")
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_tensor_get_is_virtual(self.as_ptr(), &mut out) }).unwrap();
+        out != 0
+    }
+
+    pub fn is_pass_by_value(&self) -> bool {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_tensor_get_is_pass_by_value(self.as_ptr(), &mut out) })
+            .unwrap();
+        out != 0
+    }
+
+    pub fn reordering(&self) -> TensorReordering {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_tensor_get_reordering(self.as_ptr(), &mut out) }).unwrap();
+        TensorReordering::from_ffi(out).expect("cuDNN returned an unknown reordering")
+    }
 }
 
-fn read_i64_vec(mut f: impl FnMut(*mut i64, *mut usize) -> i32) -> Result<Vec<i64>> {
+impl DataType {
+    pub fn size_bits(self) -> Option<usize> {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_data_type_size_bits(self.to_ffi(), &mut out) }).unwrap();
+        usize::try_from(out).ok().filter(|&b| b > 0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorRequirements {
+    uid: TensorId,
+    data_type: DataType,
+    dim: Vec<usize>,
+    stride: Vec<usize>,
+    is_output: bool,
+    is_pass_by_value: bool,
+    reordering: TensorReordering,
+}
+
+impl TensorRequirements {
+    pub fn uid(&self) -> TensorId {
+        self.uid
+    }
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+    pub fn dim(&self) -> &[usize] {
+        &self.dim
+    }
+    pub fn stride(&self) -> &[usize] {
+        &self.stride
+    }
+    /// Whether the graph writes to this tensor.
+    pub fn is_output(&self) -> bool {
+        self.is_output
+    }
+    pub fn is_pass_by_value(&self) -> bool {
+        self.is_pass_by_value
+    }
+
+    /// Minimum allocation length in bytes, or `None` if it cannot be determined
+    /// (unknown element size, vectorized data type, or reordered layout).
+    pub fn min_len(&self) -> Option<usize> {
+        if self.reordering != TensorReordering::None
+            || matches!(
+                self.data_type,
+                DataType::Int8x4 | DataType::Uint8x4 | DataType::Int8x32
+            )
+            || self.dim.len() != self.stride.len()
+        {
+            return None;
+        }
+        let bits = self.data_type.size_bits()?;
+        if self.dim.contains(&0) {
+            return Some(0);
+        }
+        let span = self
+            .dim
+            .iter()
+            .zip(&self.stride)
+            .try_fold(1usize, |acc, (&d, &s)| {
+                acc.checked_add((d - 1).checked_mul(s)?)
+            })
+            .expect("tensor extent overflows usize");
+        Some(
+            span.checked_mul(bits)
+                .expect("tensor extent overflows usize")
+                .div_ceil(8),
+        )
+    }
+}
+
+fn read_i64_vec(mut f: impl FnMut(*mut i64, *mut usize) -> i32) -> Vec<i64> {
     let mut len: usize = 0;
-    check(f(ptr::null_mut(), &mut len))?;
+    check(f(ptr::null_mut(), &mut len)).unwrap();
     let mut v = vec![0i64; len];
-    check(f(v.as_mut_ptr(), &mut len))?;
+    check(f(v.as_mut_ptr(), &mut len)).unwrap();
     v.truncate(len);
-    Ok(v)
+    v
+}
+
+/// Converts dimensions/strides to the signed representation used by cuDNN.
+pub(crate) fn to_ffi_dims(v: &[usize]) -> Vec<i64> {
+    v.iter()
+        .map(|&x| i64::try_from(x).expect("dimension does not fit in i64"))
+        .collect()
+}
+
+fn from_ffi_dims(v: Vec<i64>) -> Vec<usize> {
+    v.into_iter()
+        .map(|x| usize::try_from(x).expect("cuDNN returned a negative dimension"))
+        .collect()
 }
 
 #[derive(Clone)]
@@ -148,17 +302,17 @@ pub struct TensorAttributes {
     data_type: DataType,
     is_virtual: bool,
     is_pass_by_value: bool,
-    uid: Option<i64>,
-    alignment: i64,
+    uid: Option<TensorId>,
+    alignment: usize,
     reordering: TensorReordering,
     name: Option<String>,
 }
 
 impl TensorAttributes {
-    pub fn new(dim: &[i64], stride: &[i64]) -> Self {
+    pub fn new(dim: &[usize], stride: &[usize]) -> Self {
         TensorAttributes {
-            dim: dim.to_vec(),
-            stride: stride.to_vec(),
+            dim: to_ffi_dims(dim),
+            stride: to_ffi_dims(stride),
             data_type: DataType::NotSet,
             is_virtual: false,
             is_pass_by_value: false,
@@ -181,11 +335,11 @@ impl TensorAttributes {
         self.is_pass_by_value = v;
         self
     }
-    pub fn uid(mut self, uid: i64) -> Self {
+    pub fn uid(mut self, uid: TensorId) -> Self {
         self.uid = Some(uid);
         self
     }
-    pub fn alignment(mut self, a: i64) -> Self {
+    pub fn alignment(mut self, a: usize) -> Self {
         self.alignment = a;
         self
     }
@@ -202,6 +356,8 @@ impl TensorAttributes {
 pub struct GraphBuilder<'h> {
     pub(crate) raw: *mut sys::cudnnFeGraph,
     handle: &'h CudnnHandle,
+    /// Every tensor handed out by this builder, with whether the graph writes it.
+    tensors: RefCell<Vec<(*mut sys::cudnnFeTensor, bool)>>,
 }
 
 impl<'h> GraphBuilder<'h> {
@@ -209,43 +365,49 @@ impl<'h> GraphBuilder<'h> {
     pub fn new(handle: &'h CudnnHandle) -> Result<Self> {
         let mut raw = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_graph_create(&mut raw) })?;
-        Ok(Self { raw, handle })
+        Ok(Self {
+            raw,
+            handle,
+            tensors: RefCell::new(Vec::new()),
+        })
     }
 
-    pub fn set_io_data_type(&self, dt: DataType) -> Result<&Self> {
-        check(unsafe { sys::cudnn_fe_graph_set_io_data_type(self.raw, dt.to_ffi()) })?;
-        Ok(self)
+    pub fn set_io_data_type(&self, dt: DataType) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_io_data_type(self.raw, dt.to_ffi()) }).unwrap();
+        self
     }
 
-    pub fn set_intermediate_data_type(&self, dt: DataType) -> Result<&Self> {
-        check(unsafe { sys::cudnn_fe_graph_set_intermediate_data_type(self.raw, dt.to_ffi()) })?;
-        Ok(self)
+    pub fn set_intermediate_data_type(&self, dt: DataType) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_intermediate_data_type(self.raw, dt.to_ffi()) })
+            .unwrap();
+        self
     }
 
-    pub fn set_compute_data_type(&self, dt: DataType) -> Result<&Self> {
-        check(unsafe { sys::cudnn_fe_graph_set_compute_data_type(self.raw, dt.to_ffi()) })?;
-        Ok(self)
+    pub fn set_compute_data_type(&self, dt: DataType) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_compute_data_type(self.raw, dt.to_ffi()) }).unwrap();
+        self
     }
 
-    pub fn set_name(&self, name: &str) -> Result<&Self> {
+    pub fn set_name(&self, name: &str) -> &Self {
         let c = CString::new(name).unwrap();
-        check(unsafe { sys::cudnn_fe_graph_set_name(self.raw, c.as_ptr()) })?;
-        Ok(self)
+        check(unsafe { sys::cudnn_fe_graph_set_name(self.raw, c.as_ptr()) }).unwrap();
+        self
     }
 
-    pub fn set_dynamic_shape_enabled(&self, enabled: bool) -> Result<&Self> {
-        check(unsafe { sys::cudnn_fe_graph_set_dynamic_shape_enabled(self.raw, enabled as i32) })?;
-        Ok(self)
+    pub fn set_dynamic_shape_enabled(&self, enabled: bool) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_dynamic_shape_enabled(self.raw, enabled as i32) })
+            .unwrap();
+        self
     }
 
-    pub fn set_sm_count(&self, sm_count: i32) -> Result<&Self> {
-        check(unsafe { sys::cudnn_fe_graph_set_sm_count(self.raw, sm_count) })?;
-        Ok(self)
+    pub fn set_sm_count(&self, sm_count: i32) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_sm_count(self.raw, sm_count) }).unwrap();
+        self
     }
 
-    pub fn set_sm_version(&self, sm_version: i32) -> Result<&Self> {
-        check(unsafe { sys::cudnn_fe_graph_set_sm_version(self.raw, sm_version) })?;
-        Ok(self)
+    pub fn set_sm_version(&self, sm_version: i32) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_sm_version(self.raw, sm_version) }).unwrap();
+        self
     }
 
     /// Adds an input/constant tensor to the graph.
@@ -263,8 +425,8 @@ impl<'h> GraphBuilder<'h> {
             is_virtual: attrs.is_virtual as i32,
             is_pass_by_value: attrs.is_pass_by_value as i32,
             has_uid: attrs.uid.is_some() as i32,
-            uid: attrs.uid.unwrap_or(0),
-            alignment: attrs.alignment,
+            uid: attrs.uid.map_or(0, TensorId::get),
+            alignment: i64::try_from(attrs.alignment).expect("alignment does not fit in i64"),
             reordering: attrs.reordering.to_ffi(),
             ragged_offset: ptr::null(),
             ragged_offset_multiplier: 0,
@@ -272,7 +434,7 @@ impl<'h> GraphBuilder<'h> {
         };
         let mut out = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_graph_tensor(self.raw, &desc, &mut out) })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_input(out, self) })
     }
 
     pub fn tensor_like<'g>(
@@ -291,7 +453,7 @@ impl<'h> GraphBuilder<'h> {
                 &mut out,
             )
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_input(out, self) })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -323,34 +485,39 @@ impl<'h> GraphBuilder<'h> {
         })
     }
 
-    pub fn deselect_workspace_greater_than(&self, workspace: i64) -> Result<()> {
+    pub fn deselect_workspace_greater_than(&self, workspace: usize) -> &Self {
+        let workspace = i64::try_from(workspace).expect("workspace size does not fit in i64");
         check(unsafe { sys::cudnn_fe_graph_deselect_workspace_greater_than(self.raw, workspace) })
+            .unwrap();
+        self
     }
 
-    pub fn deselect_engines(&self, names: &[&str]) -> Result<()> {
+    pub fn deselect_engines(&self, names: &[&str]) -> &Self {
         let cstrs: Vec<CString> = names.iter().map(|s| CString::new(*s).unwrap()).collect();
         let ptrs: Vec<*const std::os::raw::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
         check(unsafe { sys::cudnn_fe_graph_deselect_engines(self.raw, ptrs.as_ptr(), ptrs.len()) })
+            .unwrap();
+        self
     }
 
-    pub fn execution_plan_count(&self) -> Result<i64> {
+    pub fn execution_plan_count(&self) -> usize {
         let mut out = 0;
-        check(unsafe { sys::cudnn_fe_graph_get_execution_plan_count(self.raw, &mut out) })?;
-        Ok(out)
+        check(unsafe { sys::cudnn_fe_graph_get_execution_plan_count(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).unwrap()
     }
 
-    pub fn engine_count(&self) -> Result<i64> {
+    pub fn engine_count(&self) -> usize {
         let mut out = 0;
-        check(unsafe { sys::cudnn_fe_graph_get_engine_count(self.raw, &mut out) })?;
-        Ok(out)
+        check(unsafe { sys::cudnn_fe_graph_get_engine_count(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).unwrap()
     }
 
-    pub fn plan_name_at_index(&self, index: i64) -> Result<String> {
+    pub fn plan_name_at_index(&self, index: usize) -> Result<String> {
         let mut buf = vec![0u8; 256];
         check(unsafe {
             sys::cudnn_fe_graph_get_plan_name_at_index(
                 self.raw,
-                index,
+                i64::try_from(index).unwrap(),
                 buf.as_mut_ptr() as *mut std::os::raw::c_char,
                 buf.len(),
             )
@@ -365,6 +532,7 @@ impl<'h> GraphBuilder<'h> {
             check(unsafe { sys::cudnn_fe_graph_build(self.raw, handle, raw.as_ptr(), raw.len()) })
         })?;
 
+        let tensors = self.collect_tensor_requirements();
         let raw = self.raw;
         let builder_handle = self.handle.clone();
         mem::forget(self);
@@ -374,7 +542,36 @@ impl<'h> GraphBuilder<'h> {
             raw,
             builder_handle,
             id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
+            tensors,
         })
+    }
+
+    /// Reads back the (now inferred) properties of every non-virtual tensor.
+    /// Must run after the cuDNN build so shape inference and uid assignment are done.
+    fn collect_tensor_requirements(&self) -> HashMap<TensorId, TensorRequirements> {
+        let mut map: HashMap<TensorId, TensorRequirements> = HashMap::new();
+        for &(raw, is_output) in self.tensors.borrow().iter() {
+            let t = Tensor { raw, graph: self };
+            if t.is_virtual() {
+                continue;
+            }
+            let req = TensorRequirements {
+                uid: t.uid(),
+                data_type: t.data_type(),
+                dim: t.dim(),
+                stride: t.stride(),
+                is_output,
+                is_pass_by_value: t.is_pass_by_value(),
+                reordering: t.reordering(),
+            };
+            match map.get_mut(&req.uid) {
+                Some(existing) => existing.is_output |= is_output,
+                None => {
+                    map.insert(req.uid, req);
+                }
+            }
+        }
+        map
     }
 }
 
@@ -389,17 +586,27 @@ pub struct BuiltGraph {
     #[expect(unused)]
     builder_handle: CudnnHandle,
     raw: *mut sys::cudnnFeGraph,
+    tensors: HashMap<TensorId, TensorRequirements>,
 }
 
 impl BuiltGraph {
-    pub fn workspace_size(&self) -> Result<i64> {
+    /// Requirements for the allocation bound to `uid`, if it is a non-virtual tensor of this graph.
+    pub fn tensor_requirements(&self, uid: TensorId) -> Option<&TensorRequirements> {
+        self.tensors.get(&uid)
+    }
+
+    pub fn all_tensor_requirements(&self) -> impl Iterator<Item = &TensorRequirements> {
+        self.tensors.values()
+    }
+
+    pub fn workspace_size(&self) -> usize {
         let mut out = 0;
-        check(unsafe { sys::cudnn_fe_graph_get_workspace_size(self.raw, &mut out) })?;
-        Ok(out)
+        check(unsafe { sys::cudnn_fe_graph_get_workspace_size(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).expect("cuDNN returned a negative workspace size")
     }
 
     pub fn new_variant_pack<'a>(&'a self, handle: &'a CudnnHandle) -> VariantPack<'a> {
-        VariantPack::new(self.id, handle)
+        VariantPack::new(self, handle)
     }
 
     /// # Safety
@@ -409,14 +616,15 @@ impl BuiltGraph {
         variant_pack: &VariantPack,
         workspace: &mut impl DeviceVisibleMemoryMut,
     ) -> Result<()> {
-        assert_eq!(variant_pack.graph_id, self.id);
+        assert_eq!(variant_pack.graph.id, self.id);
         let mut workspace_guard = workspace.access_mut_on(&variant_pack.handle.1)?;
         variant_pack.handle.with_ptr(|handle| {
             check(unsafe {
                 sys::cudnn_fe_graph_execute(
                     self.raw,
                     handle,
-                    variant_pack.entry_ids.as_ptr(),
+                    // `TensorId` is `repr(transparent)` over `i64`.
+                    variant_pack.entry_ids.as_ptr().cast::<i64>(),
                     variant_pack.entry_ptrs.as_ptr(),
                     variant_pack.entry_ids.len(),
                     workspace_guard.ptr(),
@@ -460,10 +668,15 @@ pub(crate) fn cstr(s: Option<&str>) -> (Option<CString>, *const std::os::raw::c_
     }
 }
 
+/// Device allocations bound to the non-virtual tensors of a [`BuiltGraph`].
+///
+/// Adding an entry panics if the uid is not a non-virtual tensor of the graph,
+/// was already added, is written by the graph but added via [`add`](Self::add),
+/// or the allocation is shorter than the tensor's extent (when determinable).
 pub struct VariantPack<'a> {
-    graph_id: u64,
+    graph: &'a BuiltGraph,
     handle: &'a CudnnHandle,
-    entry_ids: Vec<i64>,
+    entry_ids: Vec<TensorId>,
     entry_ptrs: Vec<CUdeviceptr_v2>,
     entry_guards: Vec<Box<dyn Anything + 'a>>,
 }
@@ -472,9 +685,9 @@ trait Anything {}
 impl<T> Anything for T {}
 
 impl<'a> VariantPack<'a> {
-    fn new(graph_id: u64, handle: &'a CudnnHandle) -> Self {
+    fn new(graph: &'a BuiltGraph, handle: &'a CudnnHandle) -> Self {
         Self {
-            graph_id,
+            graph,
             handle,
             entry_ids: Vec::new(),
             entry_ptrs: Vec::new(),
@@ -482,11 +695,37 @@ impl<'a> VariantPack<'a> {
         }
     }
 
+    fn validate(&self, id: TensorId, len: usize, mutable: bool) {
+        let req = self
+            .graph
+            .tensor_requirements(id)
+            .unwrap_or_else(|| panic!("tensor uid {id} is not a non-virtual tensor of this graph"));
+        assert!(
+            !self.entry_ids.contains(&id),
+            "tensor uid {id} was already added to this variant pack"
+        );
+        assert!(
+            mutable || !req.is_output,
+            "tensor uid {id} is written by the graph; use `add_mut`"
+        );
+        if let Some(min_len) = req.min_len() {
+            assert!(
+                len >= min_len,
+                "tensor uid {id} (dim {:?}, stride {:?}, {:?}) needs at least {min_len} bytes, \
+                 but the allocation is {len} bytes",
+                req.dim,
+                req.stride,
+                req.data_type,
+            );
+        }
+    }
+
     pub fn add(
         &mut self,
-        id: i64,
+        id: TensorId,
         memory: &'a impl DeviceVisibleMemory,
     ) -> skycuda::error::Result<&mut Self> {
+        self.validate(id, memory.len(), false);
         let guard = memory.access_on(&self.handle.1)?;
         let ptr = unsafe { guard.ptr() };
 
@@ -499,9 +738,10 @@ impl<'a> VariantPack<'a> {
 
     pub fn add_mut(
         &mut self,
-        id: i64,
+        id: TensorId,
         memory: &'a mut impl DeviceVisibleMemoryMut,
     ) -> skycuda::error::Result<&mut Self> {
+        self.validate(id, memory.len(), true);
         let mut guard = memory.access_mut_on(&self.handle.1)?;
         let ptr = unsafe { guard.ptr() };
 

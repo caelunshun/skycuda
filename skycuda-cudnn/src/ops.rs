@@ -1,14 +1,10 @@
-use std::ptr;
-
-use skycuda_cudnn_sys as sys;
-
-use crate::error::check;
 use crate::{
-    AttentionImplementation, ConvolutionMode, DiagonalAlignment, MoeGroupedMatmulMode,
-    NormFwdPhase, PaddingMode, PointwiseMode, ReductionMode, ResampleMode, ReshapeMode,
-    RngDistribution,
+    AttentionImplementation, ConvolutionMode, DataType, DiagonalAlignment, GraphBuilder,
+    MoeGroupedMatmulMode, NormFwdPhase, PaddingMode, PointwiseMode, ReductionMode, ResampleMode,
+    ReshapeMode, Result, RngDistribution, Tensor, cstr, error::check, opt_ptr, to_ffi_dims,
 };
-use crate::{DataType, GraphBuilder, Result, Tensor, cstr, opt_ptr};
+use skycuda_cudnn_sys as sys;
+use std::ptr;
 
 unsafe fn collect_outputs<'g, 'h, const N: usize>(
     raw: [*mut sys::cudnnFeTensor; N],
@@ -19,7 +15,7 @@ unsafe fn collect_outputs<'g, 'h, const N: usize>(
         out[i] = if raw[i].is_null() {
             None
         } else {
-            Some(unsafe { Tensor::from_raw(raw[i], graph) })
+            Some(unsafe { Tensor::from_raw_output(raw[i], graph) })
         };
     }
     out
@@ -73,7 +69,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_matmul(self.raw, a.as_ptr(), b.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -188,7 +184,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_pointwise_unary(self.raw, a.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 
     pub fn pointwise_binary<'g>(
@@ -205,7 +201,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_pointwise_binary(self.raw, a.as_ptr(), b.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 
     pub fn pointwise_ternary<'g>(
@@ -231,7 +227,7 @@ impl<'h> GraphBuilder<'h> {
                 &mut out,
             )
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -286,7 +282,7 @@ impl<'h> GraphBuilder<'h> {
         };
         let mut out = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_graph_reduction(self.raw, a.as_ptr(), &raw, &mut out) })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -371,7 +367,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_conv_fprop(self.raw, x.as_ptr(), w.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
     pub fn conv_dgrad<'g>(
         &'g self,
@@ -387,7 +383,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_conv_dgrad(self.raw, dy.as_ptr(), w.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
     pub fn conv_wgrad<'g>(
         &'g self,
@@ -403,15 +399,15 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_conv_wgrad(self.raw, x.as_ptr(), dy.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
 #[derive(Clone, Default)]
 pub struct ReshapeAttributes {
     pub mode: Option<ReshapeMode>,
-    pub dim: Vec<i64>,
-    pub stride: Vec<i64>,
+    pub dim: Vec<usize>,
+    pub stride: Vec<usize>,
     pub name: Option<String>,
 }
 impl ReshapeAttributes {
@@ -422,11 +418,11 @@ impl ReshapeAttributes {
         self.mode = Some(m);
         self
     }
-    pub fn dim(mut self, v: &[i64]) -> Self {
+    pub fn dim(mut self, v: &[usize]) -> Self {
         self.dim = v.to_vec();
         self
     }
-    pub fn stride(mut self, v: &[i64]) -> Self {
+    pub fn stride(mut self, v: &[usize]) -> Self {
         self.stride = v.to_vec();
         self
     }
@@ -495,17 +491,19 @@ impl<'h> GraphBuilder<'h> {
     pub fn reshape<'g>(&'g self, x: Tensor, attrs: &ReshapeAttributes) -> Result<Tensor<'g, 'h>> {
         assert!(x.is_in_graph(self));
         let (_n, name) = cstr(attrs.name.as_deref());
+        let dim = to_ffi_dims(&attrs.dim);
+        let stride = to_ffi_dims(&attrs.stride);
         let raw = sys::cudnnFeReshapeAttrs {
             mode: attrs.mode.unwrap_or(ReshapeMode::NotSet).to_ffi(),
-            dim: attrs.dim.as_ptr(),
-            dim_len: attrs.dim.len(),
-            stride: attrs.stride.as_ptr(),
-            stride_len: attrs.stride.len(),
+            dim: dim.as_ptr(),
+            dim_len: dim.len(),
+            stride: stride.as_ptr(),
+            stride_len: stride.len(),
             name,
         };
         let mut out = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_graph_reshape(self.raw, x.as_ptr(), &raw, &mut out) })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
     pub fn transpose<'g>(
         &'g self,
@@ -522,7 +520,7 @@ impl<'h> GraphBuilder<'h> {
         };
         let mut out = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_graph_transpose(self.raw, x.as_ptr(), &raw, &mut out) })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
     pub fn slice<'g>(&'g self, x: Tensor, attrs: &SliceAttributes) -> Result<Tensor<'g, 'h>> {
         assert!(x.is_in_graph(self));
@@ -535,7 +533,7 @@ impl<'h> GraphBuilder<'h> {
         };
         let mut out = ptr::null_mut();
         check(unsafe { sys::cudnn_fe_graph_slice(self.raw, x.as_ptr(), &raw, &mut out) })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
     pub fn concatenate<'g>(
         &'g self,
@@ -559,7 +557,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_concatenate(self.raw, ins.as_ptr(), ins.len(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -655,9 +653,9 @@ impl<'h> GraphBuilder<'h> {
         let index = if idx.is_null() {
             None
         } else {
-            Some(unsafe { Tensor::from_raw(idx, self) })
+            Some(unsafe { Tensor::from_raw_output(idx, self) })
         };
-        Ok((unsafe { Tensor::from_raw(y, self) }, index))
+        Ok((unsafe { Tensor::from_raw_output(y, self) }, index))
     }
 }
 
@@ -667,8 +665,8 @@ pub struct RngAttributes {
     pub distribution: Option<RngDistribution>,
     pub seed: Option<i64>,
     pub bernoulli_probability: Option<f64>,
-    pub dim: Vec<i64>,
-    pub stride: Vec<i64>,
+    pub dim: Vec<usize>,
+    pub stride: Vec<usize>,
     pub name: Option<String>,
 }
 impl RngAttributes {
@@ -690,11 +688,11 @@ impl RngAttributes {
         self.bernoulli_probability = Some(p);
         self
     }
-    pub fn dim(mut self, v: &[i64]) -> Self {
+    pub fn dim(mut self, v: &[usize]) -> Self {
         self.dim = v.to_vec();
         self
     }
-    pub fn stride(mut self, v: &[i64]) -> Self {
+    pub fn stride(mut self, v: &[usize]) -> Self {
         self.stride = v.to_vec();
         self
     }
@@ -719,6 +717,8 @@ impl<'h> GraphBuilder<'h> {
             assert!(offset.is_in_graph(self));
         }
         let (_n, name) = cstr(attrs.name.as_deref());
+        let dim = to_ffi_dims(&attrs.dim);
+        let stride = to_ffi_dims(&attrs.stride);
         let raw = sys::cudnnFeRngAttrs {
             compute_data_type: attrs.compute_data_type.unwrap_or(DataType::NotSet).to_ffi(),
             distribution: attrs
@@ -729,17 +729,17 @@ impl<'h> GraphBuilder<'h> {
             seed: attrs.seed.unwrap_or(0),
             has_prob: attrs.bernoulli_probability.is_some() as i32,
             bernoulli_probability: attrs.bernoulli_probability.unwrap_or(0.0),
-            dim: attrs.dim.as_ptr(),
-            dim_len: attrs.dim.len(),
-            stride: attrs.stride.as_ptr(),
-            stride_len: attrs.stride.len(),
+            dim: dim.as_ptr(),
+            dim_len: dim.len(),
+            stride: stride.as_ptr(),
+            stride_len: stride.len(),
             name,
         };
         let mut out = ptr::null_mut();
         check(unsafe {
             sys::cudnn_fe_graph_rng(self.raw, opt_ptr(seed), opt_ptr(offset), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -1067,7 +1067,7 @@ impl<'h> GraphBuilder<'h> {
                 &mut out,
             )
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 
     /// Batchnorm backward: returns `[dx, dscale, dbias]`.
@@ -1257,7 +1257,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_rope(self.raw, x.as_ptr(), freqs.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
     pub fn rope_backward<'g>(
         &'g self,
@@ -1273,7 +1273,7 @@ impl<'h> GraphBuilder<'h> {
         check(unsafe {
             sys::cudnn_fe_graph_rope_backward(self.raw, dy.as_ptr(), freqs.as_ptr(), &raw, &mut out)
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -1700,7 +1700,7 @@ impl<'h> GraphBuilder<'h> {
                 &mut out,
             )
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
 
@@ -1779,7 +1779,7 @@ impl<'h> GraphBuilder<'h> {
                 &mut out,
             )
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 
     pub fn moe_grouped_matmul_bwd<'g>(
@@ -1809,6 +1809,6 @@ impl<'h> GraphBuilder<'h> {
                 &mut out,
             )
         })?;
-        Ok(unsafe { Tensor::from_raw(out, self) })
+        Ok(unsafe { Tensor::from_raw_output(out, self) })
     }
 }
