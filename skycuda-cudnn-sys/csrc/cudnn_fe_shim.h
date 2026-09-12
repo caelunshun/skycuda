@@ -233,6 +233,8 @@ int32_t cudnn_fe_graph_set_intermediate_data_type(cudnnFeGraph*, cudnnFeDataType
 int32_t cudnn_fe_graph_set_compute_data_type(cudnnFeGraph*, cudnnFeDataType);
 int32_t cudnn_fe_graph_set_name(cudnnFeGraph*, const char* name);
 int32_t cudnn_fe_graph_set_dynamic_shape_enabled(cudnnFeGraph*, int32_t enabled);
+/* Must be called before build. Requires cuDNN backend >= 9.21.0 at execution time. */
+int32_t cudnn_fe_graph_set_override_shape_enabled(cudnnFeGraph*, int32_t enabled);
 int32_t cudnn_fe_graph_set_sm_count(cudnnFeGraph*, int32_t sm_count);
 int32_t cudnn_fe_graph_set_sm_version(cudnnFeGraph*, int32_t sm_version);
 int32_t cudnn_fe_graph_set_kernel_cache(cudnnFeGraph*, cudnnFeKernelCache*);
@@ -583,13 +585,33 @@ int32_t cudnn_fe_graph_get_plan_name_at_index(cudnnFeGraph*, int64_t index, char
 
 int32_t cudnn_fe_graph_get_workspace_size(cudnnFeGraph*, int64_t* out);
 
-/* variant pack given as parallel arrays of length n: uid[i] -> dev_ptr[i]. */
+/* Per-tensor runtime shape override, used when the graph was built with
+ * cudnn_fe_graph_set_override_shape_enabled. Tensors not listed keep their
+ * build-time shape. */
+typedef struct cudnnFeShapeOverride {
+    int64_t        uid;
+    const int64_t* dim;
+    size_t         dim_len;
+    const int64_t* stride;
+    size_t         stride_len;
+} cudnnFeShapeOverride;
+
+/* Workspace size for the given shape overrides. Requires cuDNN backend >= 9.23.0.
+ * With n_overrides == 0 this behaves like cudnn_fe_graph_get_workspace_size. */
+int32_t cudnn_fe_graph_get_workspace_size_with_overrides(cudnnFeGraph*, cudnnFeHandle*,
+                                                         const cudnnFeShapeOverride* overrides,
+                                                         size_t n_overrides, int64_t* out);
+
+/* variant pack given as parallel arrays of length n: uid[i] -> dev_ptr[i].
+ * `overrides` may be NULL when n_overrides == 0. */
 int32_t cudnn_fe_graph_execute(cudnnFeGraph*, cudnnFeHandle*,
                                const int64_t* uids, const uint64_t* dev_ptrs, size_t n,
-                               uint64_t workspace);
+                               uint64_t workspace,
+                               const cudnnFeShapeOverride* overrides, size_t n_overrides);
 int32_t cudnn_fe_graph_execute_plan_at_index(cudnnFeGraph*, cudnnFeHandle*,
                                              const int64_t* uids, const uint64_t* dev_ptrs, size_t n,
-                                             uint64_t workspace, int64_t index);
+                                             uint64_t workspace, int64_t index,
+                                             const cudnnFeShapeOverride* overrides, size_t n_overrides);
 
 int32_t cudnn_fe_graph_serialize(cudnnFeGraph*, uint8_t** out_data, size_t* out_len);
 void    cudnn_fe_buffer_free(uint8_t* data, size_t len);

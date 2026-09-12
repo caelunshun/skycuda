@@ -289,6 +289,14 @@ cudnn_fe_graph_set_dynamic_shape_enabled(cudnnFeGraph* g, int32_t enabled) {
 }
 
 extern "C" int32_t
+cudnn_fe_graph_set_override_shape_enabled(cudnnFeGraph* g, int32_t enabled) {
+    return run([&]() -> fe::error_t {
+        g->g->set_override_shape_enabled(enabled != 0);
+        return OK;
+    });
+}
+
+extern "C" int32_t
 cudnn_fe_graph_set_sm_count(cudnnFeGraph* g, int32_t sm_count) {
     return run([&]() -> fe::error_t {
         g->g->set_sm_count(sm_count);
@@ -1175,22 +1183,65 @@ build_varpack(const int64_t* uids, const uint64_t* dev_ptrs, size_t n) {
     return m;
 }
 
+// Splits the flat C array into the three parallel vectors the frontend expects.
+static void
+unpack_overrides(const cudnnFeShapeOverride* overrides, size_t n, std::vector<int64_t>& uids,
+                 std::vector<std::vector<int64_t>>& shapes, std::vector<std::vector<int64_t>>& strides) {
+    uids.reserve(n);
+    shapes.reserve(n);
+    strides.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        uids.push_back(overrides[i].uid);
+        shapes.push_back(vec(overrides[i].dim, overrides[i].dim_len));
+        strides.push_back(vec(overrides[i].stride, overrides[i].stride_len));
+    }
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_workspace_size_with_overrides(cudnnFeGraph* g, cudnnFeHandle* h,
+                                                 const cudnnFeShapeOverride* overrides, size_t n_overrides,
+                                                 int64_t* out) {
+    return run([&]() -> fe::error_t {
+        int64_t sz = 0;
+        if (n_overrides == 0) {
+            FE_CHECK(g->g->get_workspace_size(sz));
+        } else {
+            std::vector<int64_t> uids;
+            std::vector<std::vector<int64_t>> shapes, strides;
+            unpack_overrides(overrides, n_overrides, uids, shapes, strides);
+            FE_CHECK(g->g->get_workspace_size(h->h, sz, uids, shapes, strides));
+        }
+        *out = sz;
+        return OK;
+    });
+}
+
 extern "C" int32_t
 cudnn_fe_graph_execute(cudnnFeGraph* g, cudnnFeHandle* h, const int64_t* uids, const uint64_t* dev_ptrs, size_t n,
-                       uint64_t workspace) {
+                       uint64_t workspace, const cudnnFeShapeOverride* overrides, size_t n_overrides) {
     return run([&]() -> fe::error_t {
-        auto vp = build_varpack(uids, dev_ptrs, n);
-        return g->g->execute(h->h, vp, reinterpret_cast<void*>(static_cast<uintptr_t>(workspace)));
+        auto vp    = build_varpack(uids, dev_ptrs, n);
+        auto* ws_p = reinterpret_cast<void*>(static_cast<uintptr_t>(workspace));
+        if (n_overrides == 0) return g->g->execute(h->h, vp, ws_p);
+        std::vector<int64_t> o_uids;
+        std::vector<std::vector<int64_t>> o_shapes, o_strides;
+        unpack_overrides(overrides, n_overrides, o_uids, o_shapes, o_strides);
+        return g->g->execute(h->h, vp, ws_p, o_uids, o_shapes, o_strides);
     });
 }
 
 extern "C" int32_t
 cudnn_fe_graph_execute_plan_at_index(cudnnFeGraph* g, cudnnFeHandle* h, const int64_t* uids, const uint64_t* dev_ptrs,
-                                     size_t n, uint64_t workspace, int64_t index) {
+                                     size_t n, uint64_t workspace, int64_t index,
+                                     const cudnnFeShapeOverride* overrides, size_t n_overrides) {
     return run([&]() -> fe::error_t {
-        auto vp = build_varpack(uids, dev_ptrs, n);
-        return g->g->execute_plan_at_index(h->h, vp, reinterpret_cast<void*>(static_cast<uintptr_t>(workspace)),
-                                           index);
+        auto vp    = build_varpack(uids, dev_ptrs, n);
+        auto* ws_p = reinterpret_cast<void*>(static_cast<uintptr_t>(workspace));
+        if (n_overrides == 0) return g->g->execute_plan_at_index(h->h, vp, ws_p, index);
+        std::vector<int64_t> o_uids;
+        std::vector<std::vector<int64_t>> o_shapes, o_strides;
+        unpack_overrides(overrides, n_overrides, o_uids, o_shapes, o_strides);
+        return g->g->execute_plan_at_index(h->h, vp, ws_p, index, o_uids, o_shapes, o_strides);
     });
 }
 

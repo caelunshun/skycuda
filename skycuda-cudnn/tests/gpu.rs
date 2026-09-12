@@ -5,7 +5,7 @@ use skycuda::{
 };
 use skycuda_cudnn::{
     BuiltGraph, CudnnHandle, DataType, GraphBuilder, HeurMode, MatmulAttributes, TensorAttributes,
-    TensorId,
+    TensorId, backend_version,
 };
 
 #[test]
@@ -100,24 +100,32 @@ fn matmul_end_to_end() {
 
     let c_host: &[f16] = bytemuck::cast_slice(c_memory.view_mut().unwrap());
 
-    // CPU reference.
+    let reference = matmul_reference(&a_host, &b_host, b, m, k, n);
+    assert_close(c_host, &reference);
+}
+
+/// Row-major batched matmul `C[b,m,n] = A[b,m,k] @ B[b,k,n]` in f32.
+fn matmul_reference(a: &[f16], bt: &[f16], b: usize, m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut reference = vec![0f32; b * m * n];
     for bi in 0..b {
         for mi in 0..m {
             for ni in 0..n {
                 let mut acc = 0f32;
                 for ki in 0..k {
-                    let av = a_host[bi * m * k + mi * k + ki].to_f32();
-                    let bv = b_host[bi * k * n + ki * n + ni].to_f32();
-                    acc += av * bv;
+                    acc += a[bi * m * k + mi * k + ki].to_f32()
+                        * bt[bi * k * n + ki * n + ni].to_f32();
                 }
                 reference[bi * m * n + mi * n + ni] = acc;
             }
         }
     }
+    reference
+}
 
+fn assert_close(got: &[f16], want: &[f32]) {
+    assert_eq!(got.len(), want.len());
     let mut max_abs_err = 0f32;
-    for (got, want) in c_host.iter().zip(reference.iter()) {
+    for (got, want) in got.iter().zip(want) {
         max_abs_err = max_abs_err.max((got.to_f32() - want).abs());
     }
     assert!(max_abs_err.is_finite());
@@ -226,5 +234,142 @@ fn variant_pack_rejects_duplicate_uid() {
     pack.add(TensorId(1), &a_memory)
         .unwrap()
         .add(TensorId(1), &a_memory)
+        .unwrap();
+}
+
+fn build_override_matmul_graph(handle: &CudnnHandle) -> BuiltGraph {
+    let (b, m, k, n) = (1usize, 32usize, 64usize, 32usize);
+    let graph = GraphBuilder::new(handle).unwrap();
+    graph.set_io_data_type(DataType::Half);
+    graph.set_intermediate_data_type(DataType::Float);
+    graph.set_compute_data_type(DataType::Float);
+    graph.set_override_shape_enabled(true);
+
+    let a = graph
+        .tensor(&TensorAttributes::new(&[b, m, k], &[m * k, k, 1]).uid(TensorId(1)))
+        .unwrap();
+    let bt = graph
+        .tensor(&TensorAttributes::new(&[b, k, n], &[k * n, n, 1]).uid(TensorId(2)))
+        .unwrap();
+    let c = graph.matmul(a, bt, &MatmulAttributes::new()).unwrap();
+    c.set_output(true);
+    c.set_uid(TensorId(3));
+
+    graph.validate().unwrap();
+    graph.build(&[HeurMode::A, HeurMode::Fallback]).unwrap()
+}
+
+#[test]
+fn matmul_shape_override_end_to_end() {
+    if backend_version() < 92100 {
+        return;
+    }
+    let (handle, pool) = setup();
+    let graph = build_override_matmul_graph(&handle);
+    assert!(graph.is_override_shape_enabled());
+
+    for (b, m, k, n) in [(2usize, 48usize, 96usize, 40usize), (1, 128, 128, 128)] {
+        let a_host: Vec<f16> = (0..(b * m * k))
+            .map(|i| f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
+        let b_host: Vec<f16> = (0..(b * k * n))
+            .map(|i| f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+            .collect();
+
+        let mut a_memory = pool.alloc_zeroed(a_host.len() * size_of::<f16>()).unwrap();
+        a_memory
+            .view_mut()
+            .unwrap()
+            .copy_from_slice(bytemuck::cast_slice(&a_host));
+        let mut b_memory = pool.alloc_zeroed(b_host.len() * size_of::<f16>()).unwrap();
+        b_memory
+            .view_mut()
+            .unwrap()
+            .copy_from_slice(bytemuck::cast_slice(&b_host));
+        let mut c_memory = pool.alloc_zeroed(b * m * n * size_of::<f16>()).unwrap();
+
+        let mut variant_pack = graph.new_variant_pack(&handle);
+        variant_pack
+            .add_with_shape(TensorId(1), &a_memory, &[b, m, k], &[m * k, k, 1])
+            .unwrap()
+            .add_with_shape(TensorId(2), &b_memory, &[b, k, n], &[k * n, n, 1])
+            .unwrap()
+            .add_mut_with_shape(TensorId(3), &mut c_memory, &[b, m, n], &[m * n, n, 1])
+            .unwrap();
+        assert!(variant_pack.has_shape_overrides());
+
+        let ws_size = graph.workspace_size_for(&variant_pack).unwrap();
+        let mut workspace = pool.alloc_zeroed(ws_size).unwrap();
+        unsafe {
+            graph.execute(&variant_pack, &mut workspace).unwrap();
+        }
+        drop(variant_pack);
+
+        let reference = matmul_reference(&a_host, &b_host, b, m, k, n);
+        assert_close(
+            bytemuck::cast_slice(c_memory.view_mut().unwrap()),
+            &reference,
+        );
+    }
+}
+
+#[test]
+fn workspace_size_for_without_overrides_matches_static() {
+    if backend_version() < 92100 {
+        return;
+    }
+    let (handle, pool) = setup();
+    let graph = build_override_matmul_graph(&handle);
+
+    let a_memory = pool.alloc_zeroed(32 * 64 * 2).unwrap();
+    let mut variant_pack = graph.new_variant_pack(&handle);
+    variant_pack.add(TensorId(1), &a_memory).unwrap();
+    assert!(!variant_pack.has_shape_overrides());
+    assert_eq!(
+        graph.workspace_size_for(&variant_pack).unwrap(),
+        graph.workspace_size()
+    );
+}
+
+#[test]
+#[should_panic(expected = "set_override_shape_enabled")]
+fn variant_pack_rejects_override_without_flag() {
+    let (handle, pool) = setup();
+    let graph = build_matmul_graph(&handle);
+    let a_memory = pool.alloc_zeroed(4 * 32 * 64 * 2).unwrap();
+    graph
+        .new_variant_pack(&handle)
+        .add_with_shape(TensorId(1), &a_memory, &[4, 32, 64], &[32 * 64, 64, 1])
+        .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "needs at least")]
+fn variant_pack_rejects_short_allocation_for_override_shape() {
+    if backend_version() < 92100 {
+        panic!("skipped: needs at least cuDNN 9.21.0");
+    }
+    let (handle, pool) = setup();
+    let graph = build_override_matmul_graph(&handle);
+    // Sized for the cache shape (1,32,64), but the override shape is larger.
+    let a_memory = pool.alloc_zeroed(32 * 64 * 2).unwrap();
+    graph
+        .new_variant_pack(&handle)
+        .add_with_shape(TensorId(1), &a_memory, &[2, 48, 96], &[48 * 96, 96, 1])
+        .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "rank")]
+fn variant_pack_rejects_override_rank_mismatch() {
+    if backend_version() < 92100 {
+        panic!("skipped: needs at least cuDNN 9.21.0");
+    }
+    let (handle, pool) = setup();
+    let graph = build_override_matmul_graph(&handle);
+    let a_memory = pool.alloc_zeroed(32 * 64 * 2).unwrap();
+    graph
+        .new_variant_pack(&handle)
+        .add_with_shape(TensorId(1), &a_memory, &[32, 64], &[64, 1])
         .unwrap();
 }

@@ -7,7 +7,7 @@ use skycuda::{
 };
 use skycuda_cudnn_sys as sys;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ffi::CString,
     mem, ptr,
@@ -271,34 +271,49 @@ impl TensorRequirements {
 
     /// Minimum allocation length in bytes, or `None` if validation unsupported
     pub fn min_len(&self) -> Option<usize> {
-        if self.is_ragged
-            || self.reordering != TensorReordering::None
-            || matches!(
-                self.data_type,
-                DataType::Int8x4 | DataType::Uint8x4 | DataType::Int8x32
-            )
-            || self.dim.len() != self.stride.len()
-        {
-            return None;
-        }
-        let bits = self.data_type.size_bits()?;
-        if self.dim.contains(&0) {
-            return Some(0);
-        }
-        let span = self
-            .dim
-            .iter()
-            .zip(&self.stride)
-            .try_fold(1usize, |acc, (&d, &s)| {
-                acc.checked_add((d - 1).checked_mul(s)?)
-            })
-            .expect("tensor extent overflows usize");
-        Some(
-            span.checked_mul(bits)
-                .expect("tensor extent overflows usize")
-                .div_ceil(8),
+        min_len_for(
+            self.data_type,
+            &self.dim,
+            &self.stride,
+            self.is_ragged,
+            self.reordering,
         )
     }
+}
+
+fn min_len_for(
+    data_type: DataType,
+    dim: &[usize],
+    stride: &[usize],
+    is_ragged: bool,
+    reordering: TensorReordering,
+) -> Option<usize> {
+    if is_ragged
+        || reordering != TensorReordering::None
+        || matches!(
+            data_type,
+            DataType::Int8x4 | DataType::Uint8x4 | DataType::Int8x32
+        )
+        || dim.len() != stride.len()
+    {
+        return None;
+    }
+    let bits = data_type.size_bits()?;
+    if dim.contains(&0) {
+        return Some(0);
+    }
+    let span = dim
+        .iter()
+        .zip(stride)
+        .try_fold(1usize, |acc, (&d, &s)| {
+            acc.checked_add((d - 1).checked_mul(s)?)
+        })
+        .expect("tensor extent overflows usize");
+    Some(
+        span.checked_mul(bits)
+            .expect("tensor extent overflows usize")
+            .div_ceil(8),
+    )
 }
 
 fn read_i64_vec(mut f: impl FnMut(*mut i64, *mut usize) -> i32) -> Vec<i64> {
@@ -386,6 +401,7 @@ pub struct GraphBuilder<'h> {
     handle: &'h CudnnHandle,
     /// Every tensor handed out by this builder, with whether the graph writes it.
     tensors: RefCell<Vec<(*mut sys::cudnnFeTensor, bool)>>,
+    override_shape_enabled: Cell<bool>,
 }
 
 impl<'h> GraphBuilder<'h> {
@@ -397,6 +413,7 @@ impl<'h> GraphBuilder<'h> {
             raw,
             handle,
             tensors: RefCell::new(Vec::new()),
+            override_shape_enabled: Cell::new(false),
         })
     }
 
@@ -425,6 +442,15 @@ impl<'h> GraphBuilder<'h> {
     pub fn set_dynamic_shape_enabled(&self, enabled: bool) -> &Self {
         check(unsafe { sys::cudnn_fe_graph_set_dynamic_shape_enabled(self.raw, enabled as i32) })
             .unwrap();
+        self
+    }
+
+    /// Allows the built graph to be executed with shapes/strides other than the
+    /// ones it was built with (see [`VariantPack::add_with_shape`]).
+    pub fn set_override_shape_enabled(&self, enabled: bool) -> &Self {
+        check(unsafe { sys::cudnn_fe_graph_set_override_shape_enabled(self.raw, enabled as i32) })
+            .unwrap();
+        self.override_shape_enabled.set(enabled);
         self
     }
 
@@ -555,6 +581,16 @@ impl<'h> GraphBuilder<'h> {
     }
 
     pub fn build(self, modes: &[HeurMode]) -> Result<BuiltGraph> {
+        if self.override_shape_enabled.get() && backend_version() < 92100 {
+            return Err(Error {
+                code: ErrorCode::GraphNotSupported,
+                message: format!(
+                    "shape overrides require cuDNN backend 9.21.0 or newer, but the loaded \
+                     backend is version {}",
+                    backend_version()
+                ),
+            });
+        }
         let raw: Vec<sys::cudnnFeHeurMode> = modes.iter().map(|m| m.to_ffi()).collect();
         self.handle.with_ptr(|handle| {
             check(unsafe { sys::cudnn_fe_graph_build(self.raw, handle, raw.as_ptr(), raw.len()) })
@@ -563,6 +599,7 @@ impl<'h> GraphBuilder<'h> {
         let tensors = self.collect_tensor_requirements();
         let raw = self.raw;
         let builder_handle = self.handle.clone();
+        let override_shape_enabled = self.override_shape_enabled.get();
         mem::forget(self);
 
         static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(0);
@@ -571,6 +608,7 @@ impl<'h> GraphBuilder<'h> {
             builder_handle,
             id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             tensors,
+            override_shape_enabled,
         })
     }
 
@@ -616,6 +654,7 @@ pub struct BuiltGraph {
     builder_handle: CudnnHandle,
     raw: *mut sys::cudnnFeGraph,
     tensors: HashMap<TensorId, TensorRequirements>,
+    override_shape_enabled: bool,
 }
 
 impl BuiltGraph {
@@ -628,10 +667,47 @@ impl BuiltGraph {
         self.tensors.values()
     }
 
+    pub fn is_override_shape_enabled(&self) -> bool {
+        self.override_shape_enabled
+    }
+
+    /// Workspace size for the shapes the graph was built with.
     pub fn workspace_size(&self) -> usize {
         let mut out = 0;
         check(unsafe { sys::cudnn_fe_graph_get_workspace_size(self.raw, &mut out) }).unwrap();
         usize::try_from(out).expect("cuDNN returned a negative workspace size")
+    }
+
+    /// Workspace size for the shapes bound in `variant_pack`.
+    pub fn workspace_size_for(&self, variant_pack: &VariantPack) -> Result<usize> {
+        assert_eq!(variant_pack.graph.id, self.id);
+        if !variant_pack.has_shape_overrides() {
+            return Ok(self.workspace_size());
+        }
+        if backend_version() < 92300 {
+            return Err(Error {
+                code: ErrorCode::GraphNotSupported,
+                message: format!(
+                    "querying the workspace size for override shapes requires cuDNN backend \
+                     9.23.0 or newer, but the loaded backend is version {}",
+                    backend_version()
+                ),
+            });
+        }
+        let overrides = variant_pack.ffi_overrides();
+        let mut out = 0;
+        variant_pack.handle.with_ptr(|handle| {
+            check(unsafe {
+                sys::cudnn_fe_graph_get_workspace_size_with_overrides(
+                    self.raw,
+                    handle,
+                    overrides.as_ptr(),
+                    overrides.len(),
+                    &mut out,
+                )
+            })
+        })?;
+        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
     }
 
     pub fn new_variant_pack<'a>(&'a self, handle: &'a CudnnHandle) -> VariantPack<'a> {
@@ -646,6 +722,7 @@ impl BuiltGraph {
         workspace: &mut impl DeviceVisibleMemoryMut,
     ) -> Result<()> {
         assert_eq!(variant_pack.graph.id, self.id);
+        let overrides = variant_pack.ffi_overrides();
         let mut workspace_guard = workspace.access_mut_on(&variant_pack.handle.1)?;
         variant_pack.handle.with_ptr(|handle| {
             check(unsafe {
@@ -657,6 +734,36 @@ impl BuiltGraph {
                     variant_pack.entry_ptrs.as_ptr(),
                     variant_pack.entry_ids.len(),
                     workspace_guard.ptr(),
+                    overrides.as_ptr(),
+                    overrides.len(),
+                )
+            })
+        })
+    }
+
+    /// # Safety
+    /// All provided device pointers must match cuDNN expectations.
+    pub unsafe fn execute_plan_at_index(
+        &self,
+        variant_pack: &VariantPack,
+        workspace: &mut impl DeviceVisibleMemoryMut,
+        index: usize,
+    ) -> Result<()> {
+        assert_eq!(variant_pack.graph.id, self.id);
+        let overrides = variant_pack.ffi_overrides();
+        let mut workspace_guard = workspace.access_mut_on(&variant_pack.handle.1)?;
+        variant_pack.handle.with_ptr(|handle| {
+            check(unsafe {
+                sys::cudnn_fe_graph_execute_plan_at_index(
+                    self.raw,
+                    handle,
+                    variant_pack.entry_ids.as_ptr().cast::<i64>(),
+                    variant_pack.entry_ptrs.as_ptr(),
+                    variant_pack.entry_ids.len(),
+                    workspace_guard.ptr(),
+                    i64::try_from(index).expect("plan index does not fit in i64"),
+                    overrides.as_ptr(),
+                    overrides.len(),
                 )
             })
         })
@@ -708,6 +815,7 @@ pub struct VariantPack<'a> {
     entry_ids: Vec<TensorId>,
     entry_ptrs: Vec<CUdeviceptr_v2>,
     entry_guards: Vec<Box<dyn Anything + 'a>>,
+    shape_overrides: Vec<(TensorId, Vec<i64>, Vec<i64>)>,
 }
 
 trait Anything {}
@@ -721,10 +829,34 @@ impl<'a> VariantPack<'a> {
             entry_ids: Vec::new(),
             entry_ptrs: Vec::new(),
             entry_guards: Vec::new(),
+            shape_overrides: Vec::new(),
         }
     }
 
-    fn validate(&self, id: TensorId, len: usize, mutable: bool) {
+    pub fn has_shape_overrides(&self) -> bool {
+        !self.shape_overrides.is_empty()
+    }
+
+    fn ffi_overrides(&self) -> Vec<sys::cudnnFeShapeOverride> {
+        self.shape_overrides
+            .iter()
+            .map(|(uid, dim, stride)| sys::cudnnFeShapeOverride {
+                uid: uid.get(),
+                dim: dim.as_ptr(),
+                dim_len: dim.len(),
+                stride: stride.as_ptr(),
+                stride_len: stride.len(),
+            })
+            .collect()
+    }
+
+    fn validate(
+        &self,
+        id: TensorId,
+        len: usize,
+        mutable: bool,
+        shape: Option<(&[usize], &[usize])>,
+    ) {
         let req = self
             .graph
             .tensor_requirements(id)
@@ -737,13 +869,31 @@ impl<'a> VariantPack<'a> {
             mutable || !req.is_output,
             "tensor uid {id} is written by the graph; use `add_mut`"
         );
-        if let Some(min_len) = req.min_len() {
+        if let Some((dim, stride)) = shape {
+            assert!(
+                self.graph.is_override_shape_enabled(),
+                "tensor uid {id} was given a runtime shape, but the graph was not built with \
+                 `set_override_shape_enabled(true)`"
+            );
+            assert_eq!(
+                dim.len(),
+                stride.len(),
+                "tensor uid {id}: dim and stride must have the same length"
+            );
+            assert_eq!(
+                dim.len(),
+                req.dim.len(),
+                "tensor uid {id}: a shape override cannot change the rank of the tensor"
+            );
+        }
+        let (dim, stride) = shape.unwrap_or((&req.dim, &req.stride));
+        if let Some(min_len) =
+            min_len_for(req.data_type, dim, stride, req.is_ragged, req.reordering)
+        {
             assert!(
                 len >= min_len,
-                "tensor uid {id} (dim {:?}, stride {:?}, {:?}) needs at least {min_len} bytes, \
-                 but the allocation is {len} bytes",
-                req.dim,
-                req.stride,
+                "tensor uid {id} (dim {dim:?}, stride {stride:?}, {:?}) needs at least {min_len} \
+                 bytes, but the allocation is {len} bytes",
                 req.data_type,
             );
         }
@@ -754,14 +904,10 @@ impl<'a> VariantPack<'a> {
         id: TensorId,
         memory: &'a impl DeviceVisibleMemory,
     ) -> skycuda::error::Result<&mut Self> {
-        self.validate(id, memory.len(), false);
+        self.validate(id, memory.len(), false, None);
         let guard = memory.access_on(&self.handle.1)?;
         let ptr = unsafe { guard.ptr() };
-
-        self.entry_ids.push(id);
-        self.entry_ptrs.push(ptr);
-        self.entry_guards.push(Box::new(guard));
-
+        self.record(id, ptr, Box::new(guard), None);
         Ok(self)
     }
 
@@ -770,14 +916,54 @@ impl<'a> VariantPack<'a> {
         id: TensorId,
         memory: &'a mut impl DeviceVisibleMemoryMut,
     ) -> skycuda::error::Result<&mut Self> {
-        self.validate(id, memory.len(), true);
+        self.validate(id, memory.len(), true, None);
         let mut guard = memory.access_mut_on(&self.handle.1)?;
         let ptr = unsafe { guard.ptr() };
+        self.record(id, ptr, Box::new(guard), None);
+        Ok(self)
+    }
 
+    pub fn add_with_shape(
+        &mut self,
+        id: TensorId,
+        memory: &'a impl DeviceVisibleMemory,
+        dim: &[usize],
+        stride: &[usize],
+    ) -> skycuda::error::Result<&mut Self> {
+        self.validate(id, memory.len(), false, Some((dim, stride)));
+        let guard = memory.access_on(&self.handle.1)?;
+        let ptr = unsafe { guard.ptr() };
+        self.record(id, ptr, Box::new(guard), Some((dim, stride)));
+        Ok(self)
+    }
+
+    pub fn add_mut_with_shape(
+        &mut self,
+        id: TensorId,
+        memory: &'a mut impl DeviceVisibleMemoryMut,
+        dim: &[usize],
+        stride: &[usize],
+    ) -> skycuda::error::Result<&mut Self> {
+        self.validate(id, memory.len(), true, Some((dim, stride)));
+        let mut guard = memory.access_mut_on(&self.handle.1)?;
+        let ptr = unsafe { guard.ptr() };
+        self.record(id, ptr, Box::new(guard), Some((dim, stride)));
+        Ok(self)
+    }
+
+    fn record(
+        &mut self,
+        id: TensorId,
+        ptr: CUdeviceptr_v2,
+        guard: Box<dyn Anything + 'a>,
+        shape: Option<(&[usize], &[usize])>,
+    ) {
         self.entry_ids.push(id);
         self.entry_ptrs.push(ptr);
-        self.entry_guards.push(Box::new(guard));
-
-        Ok(self)
+        self.entry_guards.push(guard);
+        if let Some((dim, stride)) = shape {
+            self.shape_overrides
+                .push((id, to_ffi_dims(dim), to_ffi_dims(stride)));
+        }
     }
 }
