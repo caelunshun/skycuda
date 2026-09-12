@@ -1,6 +1,7 @@
 use crate::{device::Device, error::Result, module::Module};
 use cudarc::driver::sys::{
     CUfunction, cuFuncGetParamCount, cuFuncGetParamInfo, cuFuncLoad, cuModuleGetFunction,
+    cuOccupancyMaxActiveBlocksPerMultiprocessor,
 };
 use std::{ffi::CString, ptr, sync::Arc};
 
@@ -56,6 +57,21 @@ impl Function {
 
     pub fn cu_function(&self) -> CUfunction {
         self.0.cu_function
+    }
+
+    pub fn max_active_blocks_per_sm(&self, block_size: u32, dynamic_smem: usize) -> Result<usize> {
+        self.device().set_as_current()?;
+        let mut num_blocks = 0;
+        unsafe {
+            cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut num_blocks,
+                self.0.cu_function,
+                block_size.try_into()?,
+                dynamic_smem,
+            )
+            .result()?;
+        }
+        Ok(num_blocks.try_into()?)
     }
 
     pub fn num_params(&self) -> usize {

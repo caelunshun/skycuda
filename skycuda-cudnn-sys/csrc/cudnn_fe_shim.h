@@ -273,6 +273,10 @@ int32_t cudnn_fe_data_type_size_bits(cudnnFeDataType, int64_t* out);
 int32_t cudnn_fe_tensor_set_data_type(cudnnFeTensor*, cudnnFeDataType);
 int32_t cudnn_fe_tensor_set_dim(cudnnFeTensor*, const int64_t* dim, size_t len);
 int32_t cudnn_fe_tensor_set_stride(cudnnFeTensor*, const int64_t* stride, size_t len);
+/* `offset` must be a tensor of the same graph. multiplier 0 => leave default. */
+int32_t cudnn_fe_tensor_set_ragged_offset(cudnnFeGraph*, cudnnFeTensor*, const cudnnFeTensor* offset,
+                                          int64_t multiplier);
+int32_t cudnn_fe_tensor_get_has_ragged_offset(const cudnnFeTensor*, int32_t* out);
 
 typedef struct cudnnFeMatmulAttrs {
     cudnnFeDataType compute_data_type;

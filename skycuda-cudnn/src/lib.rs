@@ -157,6 +157,29 @@ impl<'g, 'h> Tensor<'g, 'h> {
             .unwrap()
     }
 
+    pub fn set_ragged_offset(&self, offset: Tensor<'g, 'h>, multiplier: Option<usize>) {
+        assert!(offset.is_in_graph(self.graph));
+        let multiplier = multiplier
+            .map(|m| i64::try_from(m).expect("ragged offset multiplier does not fit in i64"))
+            .unwrap_or(0);
+        check(unsafe {
+            sys::cudnn_fe_tensor_set_ragged_offset(
+                self.graph.raw,
+                self.raw,
+                offset.as_ptr(),
+                multiplier,
+            )
+        })
+        .unwrap()
+    }
+
+    pub fn has_ragged_offset(&self) -> bool {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_tensor_get_has_ragged_offset(self.as_ptr(), &mut out) })
+            .unwrap();
+        out != 0
+    }
+
     /// Reads the (possibly inferred) dimensions.
     pub fn dim(&self) -> Vec<usize> {
         from_ffi_dims(read_i64_vec(|out, len| unsafe {
@@ -217,6 +240,7 @@ pub struct TensorRequirements {
     stride: Vec<usize>,
     is_output: bool,
     is_pass_by_value: bool,
+    is_ragged: bool,
     reordering: TensorReordering,
 }
 
@@ -240,11 +264,15 @@ impl TensorRequirements {
     pub fn is_pass_by_value(&self) -> bool {
         self.is_pass_by_value
     }
+    /// Whether the tensor uses a ragged (packed) layout with a ragged offset tensor.
+    pub fn is_ragged(&self) -> bool {
+        self.is_ragged
+    }
 
-    /// Minimum allocation length in bytes, or `None` if it cannot be determined
-    /// (unknown element size, vectorized data type, or reordered layout).
+    /// Minimum allocation length in bytes, or `None` if validation unsupported
     pub fn min_len(&self) -> Option<usize> {
-        if self.reordering != TensorReordering::None
+        if self.is_ragged
+            || self.reordering != TensorReordering::None
             || matches!(
                 self.data_type,
                 DataType::Int8x4 | DataType::Uint8x4 | DataType::Int8x32
@@ -562,6 +590,7 @@ impl<'h> GraphBuilder<'h> {
                 stride: t.stride(),
                 is_output,
                 is_pass_by_value: t.is_pass_by_value(),
+                is_ragged: t.has_ragged_offset(),
                 reordering: t.reordering(),
             };
             match map.get_mut(&req.uid) {

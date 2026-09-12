@@ -20,7 +20,10 @@ use cudarc::driver::sys::{
 use std::{
     fmt::Debug,
     mem, ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -34,11 +37,18 @@ impl Stream {
             cuStreamCreate(&mut cu_stream, CU_STREAM_NON_BLOCKING as u32).result()?;
         }
 
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self(Arc::new(Inner {
+            id,
             device: device.clone(),
             cu_stream,
             events_observed: Mutex::new(Vec::new()),
         })))
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0.id
     }
 
     pub fn record_event(&self) -> Result<Event> {
@@ -202,6 +212,7 @@ impl Eq for Stream {}
 #[derive(Debug)]
 struct Inner {
     device: Device,
+    id: u64,
     cu_stream: CUstream,
     events_observed: Mutex<Vec<Event>>,
 }

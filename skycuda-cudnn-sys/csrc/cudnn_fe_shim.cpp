@@ -442,6 +442,26 @@ cudnn_fe_tensor_set_data_type(cudnnFeTensor* t, cudnnFeDataType dt) {
 }
 
 extern "C" int32_t
+cudnn_fe_tensor_set_ragged_offset(cudnnFeGraph* g, cudnnFeTensor* t, const cudnnFeTensor* offset, int64_t multiplier) {
+    return run([&]() -> fe::error_t {
+        Tensor_t off = as_t(g, offset);
+        if (!off) return {fe::error_code_t::INVALID_VALUE, "ragged offset tensor does not belong to this graph"};
+        auto* ta = reinterpret_cast<Tensor_attributes*>(t);
+        ta->set_ragged_offset(off);
+        if (multiplier) ta->set_ragged_offset_multiplier(multiplier);
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_tensor_get_has_ragged_offset(const cudnnFeTensor* t, int32_t* out) {
+    return run([&]() -> fe::error_t {
+        *out = reinterpret_cast<Tensor_attributes*>(const_cast<cudnnFeTensor*>(t))->get_ragged_offset() ? 1 : 0;
+        return OK;
+    });
+}
+
+extern "C" int32_t
 cudnn_fe_tensor_set_dim(cudnnFeTensor* t, const int64_t* dim, size_t len) {
     return run([&]() -> fe::error_t {
         reinterpret_cast<Tensor_attributes*>(t)->set_dim(vec(dim, len));

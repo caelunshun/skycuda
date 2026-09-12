@@ -5,6 +5,7 @@ use cudarc::driver::sys::CUdeviceptr_v2;
 use std::ops::RangeBounds;
 
 /// Read-only slice of device-visible memory.
+#[derive(Debug, Copy, Clone)]
 pub struct MemorySlice<T> {
     memory: T,
     offset: usize,
@@ -35,6 +36,26 @@ where
             offset,
             len,
         }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.memory
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.memory
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.memory
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 }
 
@@ -68,6 +89,7 @@ pub struct MemorySliceGuard<T> {
 }
 
 /// Mutable slice of device-visible memory.
+#[derive(Debug)]
 pub struct MemorySliceMut<T> {
     memory: T,
     offset: usize,
@@ -97,6 +119,26 @@ where
             offset,
             len,
         }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.memory
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.memory
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.memory
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
     }
 }
 
