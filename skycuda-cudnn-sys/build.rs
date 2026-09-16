@@ -13,8 +13,6 @@ fn main() {
     let shim_cpp = csrc.join("cudnn_fe_shim.cpp");
     let shim_h = csrc.join("cudnn_fe_shim.h");
 
-    // Upstream header-only cudnn-frontend tree lives at repo_root/include.
-    // From rust/cudnn-frontend-sys that is ../../include.
     let fe_include = manifest_dir.join("cudnn-frontend/include");
     assert!(
         fe_include.join("cudnn_frontend.h").exists(),
@@ -39,7 +37,6 @@ fn main() {
         })
     };
 
-    // cuDNN header (cudnn.h). Search env, then common locations.
     let cudnn_include = {
         let mut candidates = Vec::new();
         if let Ok(d) = env::var("CUDNN_INCLUDE_DIR") {
@@ -64,13 +61,12 @@ fn main() {
         .include(&cuda_include)
         .include(&cudnn_include)
         .define("NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING", None)
-        // The frontend headers are third-party; silence their warnings.
         .flag_if_supported("-Wno-deprecated-declarations")
         .flag_if_supported("-Wno-unused-parameter");
     build.compile("cudnn_fe_shim");
 
     // Dynamic loading: cuDNN + CUDA symbols resolve at runtime via dlopen.
-    // We only need libdl at link time (no -lcudnn, no -lnvrtc).
+    // We only need libdl at link time.
     println!("cargo:rustc-link-lib=dylib=dl");
 
     // --- Generate FFI bindings from the pure-C shim header ---
@@ -96,13 +92,5 @@ fn main() {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-changed=build.rs");
-    for v in [
-        "CUDNN_FRONTEND_INCLUDE_DIR",
-        "CUDA_PATH",
-        "CUDA_HOME",
-        "CUDNN_INCLUDE_DIR",
-    ] {
-        println!("cargo:rerun-if-env-changed={}", v);
-    }
     let _ = Path::new(&fe_include); // silence unused in some cfgs
 }

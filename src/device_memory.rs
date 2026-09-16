@@ -39,6 +39,7 @@ impl DeviceMemory {
             unsafe {
                 cuMemAllocFromPoolAsync(&mut ptr, len, mem_pool.cu_mempool(), stream.cu_stream())
                     .result()?;
+                mem_pool.record_allocation(len);
                 cuMemsetD8Async(ptr, 0, len, stream.cu_stream()).result()?;
             }
         }
@@ -91,6 +92,8 @@ impl DeviceMemory {
         unsafe {
             cuMemFreeAsync(self.ptr, state.last_written_stream.cu_stream()).result()?;
         }
+
+        self.mem_pool.record_deallocation(self.len);
 
         Ok(())
     }

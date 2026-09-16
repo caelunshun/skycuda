@@ -6,7 +6,14 @@ use cudarc::driver::sys::{
     CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, CUmemPoolProps_st, CUmemoryPool,
     cuMemPoolCreate, cuMemPoolDestroy, cuMemPoolSetAttribute,
 };
-use std::{ffi::c_void, ptr, sync::Arc};
+use std::{
+    ffi::c_void,
+    ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct DeviceMemoryPool(Arc<Inner>);
@@ -46,6 +53,8 @@ impl DeviceMemoryPool {
         Ok(Self(Arc::new(Inner {
             device: device.clone(),
             cu_mempool,
+            allocated_bytes: AtomicUsize::new(0),
+            peak_allocated_bytes: AtomicUsize::new(0),
         })))
     }
 
@@ -57,6 +66,40 @@ impl DeviceMemoryPool {
         self.0.cu_mempool
     }
 
+    pub(crate) fn record_allocation(&self, bytes: usize) {
+        let prev_allocated = self.0.allocated_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let new_allocated = prev_allocated + bytes;
+        loop {
+            let peak = self.0.peak_allocated_bytes.load(Ordering::Relaxed);
+            if peak > new_allocated {
+                break;
+            }
+            if self
+                .0
+                .peak_allocated_bytes
+                .compare_exchange_weak(peak, new_allocated, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn record_deallocation(&self, bytes: usize) {
+        self.0.allocated_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Current number of live allocated bytes (not including fragmentation / reserved
+    /// memory overhead).
+    pub fn current_allocated_bytes(&self) -> usize {
+        self.0.allocated_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Peak number of live allocated bytes at any point during this pool's lifetime.
+    pub fn peak_allocated_bytes(&self) -> usize {
+        self.0.peak_allocated_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn device(&self) -> &Device {
         &self.0.device
     }
@@ -66,6 +109,8 @@ impl DeviceMemoryPool {
 struct Inner {
     device: Device,
     cu_mempool: CUmemoryPool,
+    allocated_bytes: AtomicUsize,
+    peak_allocated_bytes: AtomicUsize,
 }
 
 unsafe impl Send for Inner {}
