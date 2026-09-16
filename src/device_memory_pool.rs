@@ -33,7 +33,7 @@ impl DeviceMemoryPool {
                 },
             },
             win32SecurityAttributes: ptr::null_mut(),
-            maxSize: 0,
+            maxSize: 1 << 40,
             usage: 0,
             gpuDirectRDMACapable: 0,
             reserved: [0; _],
