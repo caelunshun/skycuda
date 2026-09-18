@@ -52,7 +52,13 @@ impl Stream {
     }
 
     pub fn record_event(&self) -> Result<Event> {
-        let event = Event::record(self)?;
+        let event = Event::record(self, false)?;
+        self.0.events_observed.lock().unwrap().push(event.clone());
+        Ok(event)
+    }
+
+    pub fn record_timed_event(&self) -> Result<Event> {
+        let event = Event::record(self, true)?;
         self.0.events_observed.lock().unwrap().push(event.clone());
         Ok(event)
     }

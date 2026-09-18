@@ -18,7 +18,7 @@ use cudarc::driver::{
             CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
         },
         CUevent,
-        CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        CUevent_flags::{CU_EVENT_DEFAULT, CU_EVENT_DISABLE_TIMING},
         cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
         cuEventDestroy_v2,
     },
@@ -69,7 +69,7 @@ impl Device {
             device_ordinal: ordinal,
             cu_context,
             cached_attributes,
-            cu_event_pool: Mutex::new(Vec::new()),
+            cu_event_pool: Mutex::new([Vec::new(), Vec::new()]),
         })))
     }
 
@@ -143,22 +143,34 @@ impl Device {
         self.0.cached_attributes.max_dynamic_smem
     }
 
-    pub(crate) fn take_pooled_cu_event(&self) -> Result<CUevent> {
-        match self.0.cu_event_pool.lock().unwrap().pop() {
+    pub(crate) fn take_pooled_cu_event(&self, timing_enabled: bool) -> Result<CUevent> {
+        match self.0.cu_event_pool.lock().unwrap()[timing_enabled as usize].pop() {
             Some(event) => Ok(event),
             None => {
                 let mut event = ptr::null_mut();
                 self.set_as_current()?;
                 unsafe {
-                    cuEventCreate(&mut event, CU_EVENT_DISABLE_TIMING as u32).result()?;
+                    cuEventCreate(
+                        &mut event,
+                        if timing_enabled {
+                            CU_EVENT_DEFAULT as u32
+                        } else {
+                            CU_EVENT_DISABLE_TIMING as u32
+                        },
+                    )
+                    .result()?;
                 }
                 Ok(event)
             }
         }
     }
 
-    pub(crate) fn release_pooled_cu_event(&self, cu_event: CUevent) -> Result<()> {
-        self.0.cu_event_pool.lock().unwrap().push(cu_event);
+    pub(crate) fn release_pooled_cu_event(
+        &self,
+        cu_event: CUevent,
+        timing_enabled: bool,
+    ) -> Result<()> {
+        self.0.cu_event_pool.lock().unwrap()[timing_enabled as usize].push(cu_event);
         Ok(())
     }
 }
@@ -177,7 +189,7 @@ struct Inner {
     device_ordinal: i32,
     cu_context: CUcontext,
     cached_attributes: CachedAttributes,
-    cu_event_pool: Mutex<Vec<CUevent>>,
+    cu_event_pool: Mutex<[Vec<CUevent>; 2]>,
 }
 
 unsafe impl Send for Inner {}
@@ -186,8 +198,10 @@ unsafe impl Sync for Inner {}
 impl Drop for Inner {
     fn drop(&mut self) {
         unsafe {
-            for cu_event in self.cu_event_pool.get_mut().unwrap().drain(..) {
-                let _ = cuEventDestroy_v2(cu_event).result();
+            for event_pool in self.cu_event_pool.get_mut().unwrap() {
+                for cu_event in event_pool.drain(..) {
+                    let _ = cuEventDestroy_v2(cu_event).result();
+                }
             }
 
             let _ = cuCtxDestroy_v2(self.cu_context).result();
