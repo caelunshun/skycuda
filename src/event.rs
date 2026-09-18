@@ -81,7 +81,7 @@ impl Event {
             cuEventElapsedTime_v2(&mut millis, prev.cu_event(), self.cu_event()).result()?;
         }
 
-        Ok(Duration::from_secs_f32(millis))
+        Ok(Duration::from_secs_f64(millis as f64 / 1000.0))
     }
 
     pub(crate) fn on_completion_observed(
