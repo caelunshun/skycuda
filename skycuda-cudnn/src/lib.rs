@@ -577,6 +577,10 @@ impl<'h> GraphBuilder<'h> {
         plan_name_at_index(self.raw, index)
     }
 
+    pub fn to_json(&self) -> Result<String> {
+        graph_json(self.raw)
+    }
+
     /// Validates, builds and selects execution plans, returning an executable graph.
     pub fn build(self, modes: &[HeurMode]) -> Result<BuiltGraph> {
         self.build_with_policy(modes, BuildPlanPolicy::HeuristicsChoice)
@@ -906,6 +910,11 @@ impl BuiltGraph {
         })
     }
 
+    /// A JSON description of the graph: its context, nodes and tensors.
+    pub fn to_json(&self) -> Result<String> {
+        graph_json(self.raw)
+    }
+
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut data = ptr::null_mut();
         let mut len = 0usize;
@@ -1088,6 +1097,16 @@ impl std::fmt::Debug for ExecutionPlan<'_> {
 
 fn knob_type_from_ffi(raw: sys::cudnnFeKnobType) -> KnobType {
     KnobType::from_ffi(raw).expect("unknown knob type from cudnn-frontend")
+}
+
+fn graph_json(raw: *mut sys::cudnnFeGraph) -> Result<String> {
+    let mut data = ptr::null_mut();
+    let mut len = 0usize;
+    check(unsafe { sys::cudnn_fe_graph_print_json(raw, &mut data, &mut len) })?;
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let json = String::from_utf8_lossy(bytes).into_owned();
+    unsafe { sys::cudnn_fe_buffer_free(data, len) };
+    Ok(json)
 }
 
 fn plan_name_at_index(raw: *mut sys::cudnnFeGraph, index: usize) -> Result<String> {

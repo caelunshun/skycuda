@@ -720,6 +720,9 @@ int32_t cudnn_fe_graph_execute_plan_at_index(cudnnFeGraph*, cudnnFeHandle*,
                                              const cudnnFeShapeOverride* overrides, size_t n_overrides);
 
 int32_t cudnn_fe_graph_serialize(cudnnFeGraph*, uint8_t** out_data, size_t* out_len);
+/* JSON description of the graph structure (cudnn-frontend `Graph::print`), as
+ * UTF-8 bytes without a trailing NUL. Free with cudnn_fe_buffer_free. */
+int32_t cudnn_fe_graph_print_json(cudnnFeGraph*, uint8_t** out_data, size_t* out_len);
 void    cudnn_fe_buffer_free(uint8_t* data, size_t len);
 int32_t cudnn_fe_graph_deserialize(cudnnFeGraph*, cudnnFeHandle*, const uint8_t* data, size_t len);
 

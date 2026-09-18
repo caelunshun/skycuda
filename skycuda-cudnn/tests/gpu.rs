@@ -482,3 +482,14 @@ fn build_all_plans_and_execute_each() {
         assert_close(c_host, &reference);
     }
 }
+
+#[test]
+fn json_export_describes_graph() {
+    let (handle, _pool) = setup();
+    let graph = build_matmul_graph(&handle);
+
+    let json = graph.to_json().unwrap();
+    assert!(json.contains("\"tag\":\"MATMUL\""), "{json}");
+    assert!(json.contains("\"nodes\""), "{json}");
+    assert!(json.contains("\"tensors\""), "{json}");
+}

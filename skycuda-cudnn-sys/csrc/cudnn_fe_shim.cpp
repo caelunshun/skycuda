@@ -1418,6 +1418,18 @@ cudnn_fe_graph_serialize(cudnnFeGraph* g, uint8_t** out_data, size_t* out_len) {
     });
 }
 
+extern "C" int32_t
+cudnn_fe_graph_print_json(cudnnFeGraph* g, uint8_t** out_data, size_t* out_len) {
+    return run([&]() -> fe::error_t {
+        std::string json = g->g->print();
+        auto* buf = new uint8_t[json.size()];
+        std::memcpy(buf, json.data(), json.size());
+        *out_data = buf;
+        *out_len  = json.size();
+        return OK;
+    });
+}
+
 extern "C" void
 cudnn_fe_buffer_free(uint8_t* data, size_t) {
     delete[] data;
