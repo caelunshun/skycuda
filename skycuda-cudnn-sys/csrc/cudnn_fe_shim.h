@@ -71,6 +71,65 @@ typedef enum cudnnFeBuildPlanPolicy {
     CUDNN_FE_BUILD_PLAN_POLICY_ALL = 1
 } cudnnFeBuildPlanPolicy;
 
+typedef enum cudnnFeBehaviorNote {
+    CUDNN_FE_BEHAVIOR_NOTE_NOT_SET = 0,
+    CUDNN_FE_BEHAVIOR_NOTE_RUNTIME_COMPILATION,
+    CUDNN_FE_BEHAVIOR_NOTE_REQUIRES_FILTER_INT8x32_REORDER,
+    CUDNN_FE_BEHAVIOR_NOTE_REQUIRES_BIAS_INT8x32_REORDER,
+    CUDNN_FE_BEHAVIOR_NOTE_SUPPORTS_CUDA_GRAPH_NATIVE_API,
+    CUDNN_FE_BEHAVIOR_NOTE_CUBLASLT_DEPENDENCY
+} cudnnFeBehaviorNote;
+
+typedef enum cudnnFeNumericalNote {
+    CUDNN_FE_NUMERICAL_NOTE_NOT_SET = 0,
+    CUDNN_FE_NUMERICAL_NOTE_TENSOR_CORE,
+    CUDNN_FE_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS,
+    CUDNN_FE_NUMERICAL_NOTE_REDUCED_PRECISION_REDUCTION,
+    CUDNN_FE_NUMERICAL_NOTE_FFT,
+    CUDNN_FE_NUMERICAL_NOTE_NONDETERMINISTIC,
+    CUDNN_FE_NUMERICAL_NOTE_WINOGRAD,
+    CUDNN_FE_NUMERICAL_NOTE_WINOGRAD_TILE_4x4,
+    CUDNN_FE_NUMERICAL_NOTE_WINOGRAD_TILE_6x6,
+    CUDNN_FE_NUMERICAL_NOTE_WINOGRAD_TILE_13x13,
+    CUDNN_FE_NUMERICAL_NOTE_STRICT_NAN_PROP
+} cudnnFeNumericalNote;
+
+typedef enum cudnnFeKnobType {
+    CUDNN_FE_KNOB_TYPE_NOT_SET = 0,
+    CUDNN_FE_KNOB_TYPE_SWIZZLE,
+    CUDNN_FE_KNOB_TYPE_TILE_SIZE,
+    CUDNN_FE_KNOB_TYPE_EDGE,
+    CUDNN_FE_KNOB_TYPE_MULTIPLY,
+    CUDNN_FE_KNOB_TYPE_SPLIT_K_BUF,
+    CUDNN_FE_KNOB_TYPE_TILEK,
+    CUDNN_FE_KNOB_TYPE_STAGES,
+    CUDNN_FE_KNOB_TYPE_REDUCTION_MODE,
+    CUDNN_FE_KNOB_TYPE_SPLIT_K_SLC,
+    CUDNN_FE_KNOB_TYPE_IDX_MODE,
+    CUDNN_FE_KNOB_TYPE_SPECFILT,
+    CUDNN_FE_KNOB_TYPE_KERNEL_CFG,
+    CUDNN_FE_KNOB_TYPE_WORKSPACE,
+    CUDNN_FE_KNOB_TYPE_TILE_CGA_M,
+    CUDNN_FE_KNOB_TYPE_TILE_CGA_N,
+    CUDNN_FE_KNOB_TYPE_BLOCK_SIZE,
+    CUDNN_FE_KNOB_TYPE_OCCUPANCY,
+    CUDNN_FE_KNOB_TYPE_ARRAY_SIZE_PER_THREAD,
+    CUDNN_FE_KNOB_TYPE_SPLIT_COLS,
+    CUDNN_FE_KNOB_TYPE_TILE_ROWS,
+    CUDNN_FE_KNOB_TYPE_TILE_COLS,
+    CUDNN_FE_KNOB_TYPE_LOAD_SIZE,
+    CUDNN_FE_KNOB_TYPE_CTA_COUNT,
+    CUDNN_FE_KNOB_TYPE_STREAM_K,
+    CUDNN_FE_KNOB_TYPE_SPLIT_P_SLC,
+    CUDNN_FE_KNOB_TYPE_TILE_M,
+    CUDNN_FE_KNOB_TYPE_TILE_N,
+    CUDNN_FE_KNOB_TYPE_WARP_SPEC_CFG,
+    CUDNN_FE_KNOB_TYPE_SWAP_AB,
+    CUDNN_FE_KNOB_TYPE_INPUT_TMA_ENABLE,
+    CUDNN_FE_KNOB_TYPE_OUTPUT_TMA_ENABLE,
+    CUDNN_FE_KNOB_TYPE_TILE_CGA
+} cudnnFeKnobType;
+
 typedef enum cudnnFePointwiseMode {
     CUDNN_FE_POINTWISE_NOT_SET = 0,
     CUDNN_FE_POINTWISE_ADD,
@@ -574,16 +633,58 @@ int32_t cudnn_fe_graph_build_operation_graph(cudnnFeGraph*, cudnnFeHandle*);
 int32_t cudnn_fe_graph_create_execution_plans(cudnnFeGraph*, const cudnnFeHeurMode* modes, size_t n_modes);
 int32_t cudnn_fe_graph_check_support(cudnnFeGraph*, cudnnFeHandle*);
 int32_t cudnn_fe_graph_build_plans(cudnnFeGraph*, cudnnFeHandle*, cudnnFeBuildPlanPolicy);
-int32_t cudnn_fe_graph_build(cudnnFeGraph*, cudnnFeHandle*, const cudnnFeHeurMode* modes, size_t n_modes);
+/* Builds only the plan at `index` (validate/create_execution_plans must have run). */
+int32_t cudnn_fe_graph_build_plan_at_index(cudnnFeGraph*, cudnnFeHandle*, int64_t index);
+int32_t cudnn_fe_graph_build(cudnnFeGraph*, cudnnFeHandle*, const cudnnFeHeurMode* modes, size_t n_modes,
+                             cudnnFeBuildPlanPolicy policy);
 
 int32_t cudnn_fe_graph_deselect_workspace_greater_than(cudnnFeGraph*, int64_t workspace);
 int32_t cudnn_fe_graph_deselect_engines(cudnnFeGraph*, const char* const* names, size_t n_names);
 
+/* --- Execution plan introspection ---
+ * Plans are indexed 0..execution_plan_count in heuristics priority order. Every
+ * plan returned by the heuristics has a name, notes and engine/knob config; only
+ * plans that were actually built (all of them under POLICY_ALL, the first
+ * supported one under HEURISTICS_CHOICE) can report a workspace size or execute.
+ *
+ * Array-returning queries follow one convention: up to `cap` elements are written
+ * to `out`, and the full element count is stored in `*out_len` (which may exceed
+ * `cap`, in which case the caller should retry with a larger buffer). */
 int32_t cudnn_fe_graph_get_execution_plan_count(cudnnFeGraph*, int64_t* out);
 int32_t cudnn_fe_graph_get_engine_count(cudnnFeGraph*, int64_t* out);
-int32_t cudnn_fe_graph_get_plan_name_at_index(cudnnFeGraph*, int64_t index, char* buf, size_t buf_len);
+/* Index of the plan `cudnn_fe_graph_execute` runs, or -1 if no plan was built. */
+int32_t cudnn_fe_graph_get_candidate_plan_index(cudnnFeGraph*, int64_t* out);
+/* NUL-terminated name (engine tag such as "eng0_k2=3"), truncated to buf_len;
+ * *out_len receives the untruncated length. */
+int32_t cudnn_fe_graph_get_plan_name_at_index(cudnnFeGraph*, int64_t index, char* buf, size_t buf_len,
+                                              size_t* out_len);
+int32_t cudnn_fe_graph_is_plan_built_at_index(cudnnFeGraph*, int64_t index, int32_t* out);
+
+typedef struct cudnnFeKnobChoice {
+    cudnnFeKnobType type;
+    int64_t         value;
+} cudnnFeKnobChoice;
+/* Engine (global engine id) + knob choices that make up the plan. */
+int32_t cudnn_fe_graph_get_plan_engine_and_knobs_at_index(cudnnFeGraph*, int64_t index, int64_t* engine_id,
+                                                          cudnnFeKnobChoice* out, size_t cap, size_t* out_len);
+int32_t cudnn_fe_graph_get_plan_behavior_notes_at_index(cudnnFeGraph*, int64_t index, cudnnFeBehaviorNote* out,
+                                                        size_t cap, size_t* out_len);
+int32_t cudnn_fe_graph_get_plan_numerical_notes_at_index(cudnnFeGraph*, int64_t index, cudnnFeNumericalNote* out,
+                                                         size_t cap, size_t* out_len);
+
+typedef struct cudnnFeKnob {
+    cudnnFeKnobType type;
+    int64_t         min_value;
+    int64_t         max_value;
+    int64_t         stride;
+} cudnnFeKnob;
+/* Tunable knobs (and their ranges) supported by a global engine id. */
+int32_t cudnn_fe_graph_get_knobs_for_engine(cudnnFeGraph*, int64_t engine_id, cudnnFeKnob* out, size_t cap,
+                                            size_t* out_len);
 
 int32_t cudnn_fe_graph_get_workspace_size(cudnnFeGraph*, int64_t* out);
+/* Largest workspace over all built plans; enough to execute any plan index. */
+int32_t cudnn_fe_graph_get_max_workspace_size(cudnnFeGraph*, int64_t* out);
 
 /* Per-tensor runtime shape override, used when the graph was built with
  * cudnn_fe_graph_set_override_shape_enabled. Tensors not listed keep their
@@ -601,6 +702,11 @@ typedef struct cudnnFeShapeOverride {
 int32_t cudnn_fe_graph_get_workspace_size_with_overrides(cudnnFeGraph*, cudnnFeHandle*,
                                                          const cudnnFeShapeOverride* overrides,
                                                          size_t n_overrides, int64_t* out);
+/* Workspace size for a specific (built) plan. n_overrides == 0 queries the
+ * build-time shapes; otherwise requires cuDNN backend >= 9.23.0. */
+int32_t cudnn_fe_graph_get_plan_workspace_size_at_index(cudnnFeGraph*, cudnnFeHandle*, int64_t index,
+                                                        const cudnnFeShapeOverride* overrides,
+                                                        size_t n_overrides, int64_t* out);
 
 /* variant pack given as parallel arrays of length n: uid[i] -> dev_ptr[i].
  * `overrides` may be NULL when n_overrides == 0. */

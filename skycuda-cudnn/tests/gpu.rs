@@ -4,8 +4,8 @@ use skycuda::{
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
 };
 use skycuda_cudnn::{
-    BuiltGraph, CudnnHandle, DataType, GraphBuilder, HeurMode, MatmulAttributes, TensorAttributes,
-    TensorId, backend_version,
+    BuildPlanPolicy, BuiltGraph, CudnnHandle, DataType, GraphBuilder, HeurMode, MatmulAttributes,
+    TensorAttributes, TensorId, backend_version,
 };
 
 #[test]
@@ -137,6 +137,10 @@ fn assert_close(got: &[f16], want: &[f32]) {
 
 /// Builds `C[2,32,48] = A[2,32,64] @ B[2,64,48]` in half precision with uids 1, 2, 3.
 fn build_matmul_graph(handle: &CudnnHandle) -> BuiltGraph {
+    build_matmul_graph_with_policy(handle, BuildPlanPolicy::HeuristicsChoice)
+}
+
+fn build_matmul_graph_with_policy(handle: &CudnnHandle, policy: BuildPlanPolicy) -> BuiltGraph {
     let (b, m, k, n) = (2usize, 32usize, 64usize, 48usize);
     let graph = GraphBuilder::new(handle).unwrap();
     graph.set_io_data_type(DataType::Half);
@@ -154,7 +158,9 @@ fn build_matmul_graph(handle: &CudnnHandle) -> BuiltGraph {
     c.set_uid(TensorId(3));
 
     graph.validate().unwrap();
-    graph.build(&[HeurMode::A, HeurMode::B]).unwrap()
+    graph
+        .build_with_policy(&[HeurMode::A, HeurMode::B], policy)
+        .unwrap()
 }
 
 fn setup() -> (CudnnHandle, HostPinnedMemoryPool) {
@@ -372,4 +378,107 @@ fn variant_pack_rejects_override_rank_mismatch() {
         .new_variant_pack(&handle)
         .add_with_shape(TensorId(1), &a_memory, &[32, 64], &[64, 1])
         .unwrap();
+}
+
+#[test]
+fn heuristics_choice_builds_only_candidate() {
+    let (handle, _pool) = setup();
+    let graph = build_matmul_graph(&handle);
+
+    let candidate = graph.candidate_plan();
+    assert!(candidate.is_built());
+    assert!(candidate.is_candidate());
+    assert_eq!(candidate.workspace_size().unwrap(), graph.workspace_size());
+    assert_eq!(graph.max_workspace_size(), graph.workspace_size());
+
+    // Every plan is describable even when it was not built.
+    for plan in graph.plans() {
+        assert!(!plan.name().is_empty());
+        let config = plan.engine_config().unwrap();
+        assert!(config.engine_id < graph.engine_count());
+        let _ = plan.behavior_notes();
+        let _ = plan.numerical_notes();
+        if plan.index() != candidate.index() {
+            assert!(!plan.is_built());
+            assert!(plan.workspace_size().is_err());
+        }
+    }
+}
+
+#[test]
+fn build_all_plans_and_execute_each() {
+    let (handle, pool) = setup();
+    let graph = build_matmul_graph_with_policy(&handle, BuildPlanPolicy::All);
+
+    let plans: Vec<_> = graph.plans().filter(|p| p.is_built()).collect();
+    assert!(!plans.is_empty());
+    assert!(plans.iter().any(|p| p.is_candidate()));
+    assert_eq!(graph.plans().len(), graph.execution_plan_count());
+    println!(
+        "{} of {} plans built",
+        plans.len(),
+        graph.execution_plan_count()
+    );
+
+    for plan in &plans {
+        println!("{plan:?} {:?}", plan.engine_config().unwrap());
+        assert!(!plan.name().is_empty());
+        assert!(plan.workspace_size().unwrap() <= graph.max_workspace_size());
+        for choice in plan.engine_config().unwrap().knobs {
+            assert_ne!(choice.knob_type, skycuda_cudnn::KnobType::NotSet);
+        }
+        for note in plan.numerical_notes() {
+            assert_ne!(note, skycuda_cudnn::NumericalNote::NotSet);
+        }
+    }
+    let knobs = graph
+        .knobs_for_engine(plans[0].engine_config().unwrap().engine_id)
+        .unwrap();
+    for knob in knobs {
+        assert!(knob.min_value <= knob.max_value);
+    }
+
+    let (b, m, k, n) = (2usize, 32usize, 64usize, 48usize);
+    let a_host: Vec<f16> = (0..(b * m * k))
+        .map(|i| f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+        .collect();
+    let b_host: Vec<f16> = (0..(b * k * n))
+        .map(|i| f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+        .collect();
+    let mut a_memory = pool.alloc_zeroed(a_host.len() * size_of::<f16>()).unwrap();
+    a_memory
+        .view_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::cast_slice(&a_host));
+    let mut b_memory = pool.alloc_zeroed(b_host.len() * size_of::<f16>()).unwrap();
+    b_memory
+        .view_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::cast_slice(&b_host));
+    let mut c_memory = pool.alloc_zeroed(b * m * n * size_of::<f16>()).unwrap();
+    let mut workspace = pool
+        .alloc_zeroed(graph.max_workspace_size().max(1))
+        .unwrap();
+    let reference = matmul_reference(&a_host, &b_host, b, m, k, n);
+
+    for plan in &plans {
+        c_memory.view_mut().unwrap().fill(0);
+        {
+            let mut variant_pack = graph.new_variant_pack(&handle);
+            variant_pack
+                .add(TensorId(1), &a_memory)
+                .unwrap()
+                .add(TensorId(2), &b_memory)
+                .unwrap()
+                .add_mut(TensorId(3), &mut c_memory)
+                .unwrap();
+            assert_eq!(
+                plan.workspace_size_for(&variant_pack).unwrap(),
+                plan.workspace_size().unwrap()
+            );
+            unsafe { plan.execute(&variant_pack, &mut workspace).unwrap() };
+        }
+        let c_host: &[f16] = bytemuck::cast_slice(c_memory.view_mut().unwrap());
+        assert_close(c_host, &reference);
+    }
 }

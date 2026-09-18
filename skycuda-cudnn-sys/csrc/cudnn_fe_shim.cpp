@@ -2,6 +2,7 @@
 
 #include "cudnn_frontend.h"
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -43,6 +44,22 @@ FE_ASSERT_ENUM(CUDNN_FE_HEUR_MODE_FALLBACK, fe::HeurMode_t::FALLBACK);
 // BuildPlanPolicy_t
 FE_ASSERT_ENUM(CUDNN_FE_BUILD_PLAN_POLICY_HEURISTICS_CHOICE, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE);
 FE_ASSERT_ENUM(CUDNN_FE_BUILD_PLAN_POLICY_ALL, fe::BuildPlanPolicy_t::ALL);
+// BehaviorNote_t
+FE_ASSERT_ENUM(CUDNN_FE_BEHAVIOR_NOTE_NOT_SET, fe::BehaviorNote_t::NOT_SET);
+FE_ASSERT_ENUM(CUDNN_FE_BEHAVIOR_NOTE_RUNTIME_COMPILATION, fe::BehaviorNote_t::RUNTIME_COMPILATION);
+FE_ASSERT_ENUM(CUDNN_FE_BEHAVIOR_NOTE_CUBLASLT_DEPENDENCY, fe::BehaviorNote_t::CUBLASLT_DEPENDENCY);
+// NumericalNote_t
+FE_ASSERT_ENUM(CUDNN_FE_NUMERICAL_NOTE_NOT_SET, fe::NumericalNote_t::NOT_SET);
+FE_ASSERT_ENUM(CUDNN_FE_NUMERICAL_NOTE_TENSOR_CORE, fe::NumericalNote_t::TENSOR_CORE);
+FE_ASSERT_ENUM(CUDNN_FE_NUMERICAL_NOTE_NONDETERMINISTIC, fe::NumericalNote_t::NONDETERMINISTIC);
+FE_ASSERT_ENUM(CUDNN_FE_NUMERICAL_NOTE_STRICT_NAN_PROP, fe::NumericalNote_t::STRICT_NAN_PROP);
+// KnobType_t
+FE_ASSERT_ENUM(CUDNN_FE_KNOB_TYPE_NOT_SET, fe::KnobType_t::NOT_SET);
+FE_ASSERT_ENUM(CUDNN_FE_KNOB_TYPE_SWIZZLE, fe::KnobType_t::SWIZZLE);
+FE_ASSERT_ENUM(CUDNN_FE_KNOB_TYPE_WORKSPACE, fe::KnobType_t::WORKSPACE);
+FE_ASSERT_ENUM(CUDNN_FE_KNOB_TYPE_TILE_CGA_M, fe::KnobType_t::TILE_CGA_M);
+FE_ASSERT_ENUM(CUDNN_FE_KNOB_TYPE_SPLIT_COLS, fe::KnobType_t::SPLIT_COLS);
+FE_ASSERT_ENUM(CUDNN_FE_KNOB_TYPE_TILE_CGA, fe::KnobType_t::TILE_CGA);
 // PointwiseMode_t
 FE_ASSERT_ENUM(CUDNN_FE_POINTWISE_NOT_SET, fe::PointwiseMode_t::NOT_SET);
 FE_ASSERT_ENUM(CUDNN_FE_POINTWISE_ADD, fe::PointwiseMode_t::ADD);
@@ -83,8 +100,31 @@ FE_ASSERT_ENUM(CUDNN_FE_MOE_GMM_SCATTER, fe::MoeGroupedMatmulMode_t::SCATTER);
 FE_ASSERT_ENUM(CUDNN_FE_ATTENTION_IMPL_AUTO, fe::AttentionImplementation_t::AUTO);
 FE_ASSERT_ENUM(CUDNN_FE_ATTENTION_IMPL_UNIFIED, fe::AttentionImplementation_t::UNIFIED);
 
+static const fe::error_t OK = {fe::error_code_t::OK, ""};
+
+// `plans` is a protected member of ICudnn; Graph's public API does not surface
+// the candidate index, per-plan built state or numerical notes, so read them here.
+struct ShimGraph : public Graph {
+    int64_t candidate() const { return plans.candidate; }
+
+    bool is_plan_built(int64_t i) const {
+        return i >= 0 && i < static_cast<int64_t>(plans.execution_plans.size()) && plans.execution_plans[i] != nullptr;
+    }
+
+    fe::error_t numerical_notes_at_index(int64_t i, std::vector<fe::NumericalNote_t>& notes) const {
+        if (i < 0 || i >= static_cast<int64_t>(plans.numeric_notes.size()))
+            return {fe::error_code_t::GRAPH_EXECUTION_FAILED, "Plan index " + std::to_string(i) + " is invalid."};
+        // Execution_plan_list::query_properties resize()s before push_back()ing, so
+        // each list is prefixed with as many NOT_SET entries as real notes.
+        notes.clear();
+        for (auto n : plans.numeric_notes[i])
+            if (n != fe::NumericalNote_t::NOT_SET) notes.push_back(n);
+        return OK;
+    }
+};
+
 struct cudnnFeGraph {
-    std::shared_ptr<Graph> g = std::make_shared<Graph>();
+    std::shared_ptr<ShimGraph> g = std::make_shared<ShimGraph>();
     // Keeps every Tensor_attributes handed out alive for the graph's lifetime,
     // and lets us recover the shared_ptr from a raw handle.
     std::unordered_map<Tensor_attributes*, Tensor_t> registry;
@@ -130,8 +170,6 @@ run(const std::function<fe::error_t()>& f) {
         return CUDNN_FE_SHIM_EXCEPTION;
     }
 }
-
-static const fe::error_t OK = {fe::error_code_t::OK, ""};
 
 #define FE_CHECK(x)                       \
     do {                                  \
@@ -1102,7 +1140,13 @@ cudnn_fe_graph_build_plans(cudnnFeGraph* g, cudnnFeHandle* h, cudnnFeBuildPlanPo
 }
 
 extern "C" int32_t
-cudnn_fe_graph_build(cudnnFeGraph* g, cudnnFeHandle* h, const cudnnFeHeurMode* modes, size_t n_modes) {
+cudnn_fe_graph_build_plan_at_index(cudnnFeGraph* g, cudnnFeHandle* h, int64_t index) {
+    return run([&]() -> fe::error_t { return g->g->build_plan_at_index(h->h, index); });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_build(cudnnFeGraph* g, cudnnFeHandle* h, const cudnnFeHeurMode* modes, size_t n_modes,
+                     cudnnFeBuildPlanPolicy policy) {
     return run([&]() -> fe::error_t {
         std::vector<fe::HeurMode_t> ms;
         for (size_t i = 0; i < n_modes; ++i) ms.push_back(static_cast<fe::HeurMode_t>(modes[i]));
@@ -1110,7 +1154,7 @@ cudnn_fe_graph_build(cudnnFeGraph* g, cudnnFeHandle* h, const cudnnFeHeurMode* m
         FE_CHECK(g->g->build_operation_graph(h->h));
         FE_CHECK(g->g->create_execution_plans(ms));
         FE_CHECK(g->g->check_support(h->h));
-        FE_CHECK(g->g->build_plans(h->h, fe::BuildPlanPolicy_t::HEURISTICS_CHOICE));
+        FE_CHECK(g->g->build_plans(h->h, static_cast<fe::BuildPlanPolicy_t>(policy)));
         return OK;
     });
 }
@@ -1152,7 +1196,16 @@ cudnn_fe_graph_get_engine_count(cudnnFeGraph* g, int64_t* out) {
 }
 
 extern "C" int32_t
-cudnn_fe_graph_get_plan_name_at_index(cudnnFeGraph* g, int64_t index, char* buf, size_t buf_len) {
+cudnn_fe_graph_get_candidate_plan_index(cudnnFeGraph* g, int64_t* out) {
+    return run([&]() -> fe::error_t {
+        *out = g->g->candidate();
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_plan_name_at_index(cudnnFeGraph* g, int64_t index, char* buf, size_t buf_len,
+                                      size_t* out_len) {
     return run([&]() -> fe::error_t {
         std::string name;
         FE_CHECK(g->g->get_plan_name_at_index(index, name));
@@ -1160,6 +1213,77 @@ cudnn_fe_graph_get_plan_name_at_index(cudnnFeGraph* g, int64_t index, char* buf,
             std::strncpy(buf, name.c_str(), buf_len - 1);
             buf[buf_len - 1] = '\0';
         }
+        *out_len = name.size();
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_is_plan_built_at_index(cudnnFeGraph* g, int64_t index, int32_t* out) {
+    return run([&]() -> fe::error_t {
+        *out = g->g->is_plan_built(index) ? 1 : 0;
+        return OK;
+    });
+}
+
+// Copies up to `cap` converted elements and reports the full count.
+template <typename T, typename U, typename F>
+static void
+copy_out(const std::vector<T>& src, U* out, size_t cap, size_t* out_len, F conv) {
+    size_t n = std::min(src.size(), out ? cap : size_t(0));
+    for (size_t i = 0; i < n; ++i) out[i] = conv(src[i]);
+    *out_len = src.size();
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_plan_engine_and_knobs_at_index(cudnnFeGraph* g, int64_t index, int64_t* engine_id,
+                                                  cudnnFeKnobChoice* out, size_t cap, size_t* out_len) {
+    return run([&]() -> fe::error_t {
+        int64_t eid = -1;
+        std::unordered_map<fe::KnobType_t, int64_t> knobs;
+        FE_CHECK(g->g->get_engine_and_knobs_at_index(index, eid, knobs));
+        std::vector<std::pair<fe::KnobType_t, int64_t>> sorted(knobs.begin(), knobs.end());
+        std::sort(sorted.begin(), sorted.end());
+        *engine_id = eid;
+        copy_out(sorted, out, cap, out_len, [](const std::pair<fe::KnobType_t, int64_t>& k) {
+            return cudnnFeKnobChoice{static_cast<cudnnFeKnobType>(k.first), k.second};
+        });
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_plan_behavior_notes_at_index(cudnnFeGraph* g, int64_t index, cudnnFeBehaviorNote* out,
+                                                size_t cap, size_t* out_len) {
+    return run([&]() -> fe::error_t {
+        std::vector<fe::BehaviorNote_t> notes;
+        FE_CHECK(g->g->get_behavior_notes_for_plan_at_index(index, notes));
+        copy_out(notes, out, cap, out_len, [](fe::BehaviorNote_t n) { return static_cast<cudnnFeBehaviorNote>(n); });
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_plan_numerical_notes_at_index(cudnnFeGraph* g, int64_t index, cudnnFeNumericalNote* out,
+                                                 size_t cap, size_t* out_len) {
+    return run([&]() -> fe::error_t {
+        std::vector<fe::NumericalNote_t> notes;
+        FE_CHECK(g->g->numerical_notes_at_index(index, notes));
+        copy_out(notes, out, cap, out_len,
+                 [](fe::NumericalNote_t n) { return static_cast<cudnnFeNumericalNote>(n); });
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_knobs_for_engine(cudnnFeGraph* g, int64_t engine_id, cudnnFeKnob* out, size_t cap,
+                                    size_t* out_len) {
+    return run([&]() -> fe::error_t {
+        std::vector<fe::Knob> knobs;
+        FE_CHECK(g->g->get_knobs_for_engine(engine_id, knobs));
+        copy_out(knobs, out, cap, out_len, [](const fe::Knob& k) {
+            return cudnnFeKnob{static_cast<cudnnFeKnobType>(k.type), k.minValue, k.maxValue, k.stride};
+        });
         return OK;
     });
 }
@@ -1170,6 +1294,23 @@ cudnn_fe_graph_get_workspace_size(cudnnFeGraph* g, int64_t* out) {
         int64_t sz = 0;
         FE_CHECK(g->g->get_workspace_size(sz));
         *out = sz;
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_max_workspace_size(cudnnFeGraph* g, int64_t* out) {
+    return run([&]() -> fe::error_t {
+        // Not Graph::get_autotune_workspace_size(): that dereferences every
+        // execution plan, including the null ones that were never built.
+        int64_t max_sz = 0;
+        for (int64_t i = 0, n = g->g->get_execution_plan_count(); i < n; ++i) {
+            if (!g->g->is_plan_built(i)) continue;
+            int64_t sz = 0;
+            FE_CHECK(g->g->get_workspace_size_plan_at_index(i, sz));
+            max_sz = std::max(max_sz, sz);
+        }
+        *out = max_sz;
         return OK;
     });
 }
@@ -1210,6 +1351,25 @@ cudnn_fe_graph_get_workspace_size_with_overrides(cudnnFeGraph* g, cudnnFeHandle*
             std::vector<std::vector<int64_t>> shapes, strides;
             unpack_overrides(overrides, n_overrides, uids, shapes, strides);
             FE_CHECK(g->g->get_workspace_size(h->h, sz, uids, shapes, strides));
+        }
+        *out = sz;
+        return OK;
+    });
+}
+
+extern "C" int32_t
+cudnn_fe_graph_get_plan_workspace_size_at_index(cudnnFeGraph* g, cudnnFeHandle* h, int64_t index,
+                                                const cudnnFeShapeOverride* overrides, size_t n_overrides,
+                                                int64_t* out) {
+    return run([&]() -> fe::error_t {
+        int64_t sz = 0;
+        if (n_overrides == 0) {
+            FE_CHECK(g->g->get_workspace_size_plan_at_index(index, sz));
+        } else {
+            std::vector<int64_t> uids;
+            std::vector<std::vector<int64_t>> shapes, strides;
+            unpack_overrides(overrides, n_overrides, uids, shapes, strides);
+            FE_CHECK(g->g->get_workspace_size_plan_at_index(h->h, index, sz, uids, shapes, strides));
         }
         *out = sz;
         return OK;

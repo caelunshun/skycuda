@@ -12,6 +12,7 @@ macro_rules! ffi_enum {
         }
         impl $name {
             #[inline]
+            #[allow(dead_code)]
             pub(crate) fn to_ffi(self) -> $ffi {
                 self as i32 as $ffi
             }
@@ -50,6 +51,39 @@ ffi_enum! {
     /// Plan build policy (`BuildPlanPolicy_t`).
     BuildPlanPolicy: sys::cudnnFeBuildPlanPolicy {
         HeuristicsChoice = 0, All = 1,
+    }
+}
+
+ffi_enum! {
+    /// Engine behavior note (`BehaviorNote_t`).
+    BehaviorNote: sys::cudnnFeBehaviorNote {
+        NotSet = 0, RuntimeCompilation = 1, RequiresFilterInt8x32Reorder = 2,
+        RequiresBiasInt8x32Reorder = 3, SupportsCudaGraphNativeApi = 4,
+        CublasltDependency = 5,
+    }
+}
+
+ffi_enum! {
+    /// Engine numerical note (`NumericalNote_t`).
+    NumericalNote: sys::cudnnFeNumericalNote {
+        NotSet = 0, TensorCore = 1, DownConvertInputs = 2,
+        ReducedPrecisionReduction = 3, Fft = 4, Nondeterministic = 5,
+        Winograd = 6, WinogradTile4x4 = 7, WinogradTile6x6 = 8,
+        WinogradTile13x13 = 9, StrictNanProp = 10,
+    }
+}
+
+ffi_enum! {
+    /// Engine knob (`KnobType_t`).
+    KnobType: sys::cudnnFeKnobType {
+        NotSet = 0, Swizzle = 1, TileSize = 2, Edge = 3, Multiply = 4,
+        SplitKBuf = 5, TileK = 6, Stages = 7, ReductionMode = 8, SplitKSlc = 9,
+        IdxMode = 10, Specfilt = 11, KernelCfg = 12, Workspace = 13,
+        TileCgaM = 14, TileCgaN = 15, BlockSize = 16, Occupancy = 17,
+        ArraySizePerThread = 18, SplitCols = 19, TileRows = 20, TileCols = 21,
+        LoadSize = 22, CtaCount = 23, StreamK = 24, SplitPSlc = 25, TileM = 26,
+        TileN = 27, WarpSpecCfg = 28, SwapAb = 29, InputTmaEnable = 30,
+        OutputTmaEnable = 31, TileCga = 32,
     }
 }
 

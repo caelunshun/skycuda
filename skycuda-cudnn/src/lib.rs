@@ -539,6 +539,13 @@ impl<'h> GraphBuilder<'h> {
         })
     }
 
+    pub fn build_plan_at_index(&self, index: usize) -> Result<()> {
+        let index = i64::try_from(index).expect("plan index does not fit in i64");
+        self.handle.with_ptr(|handle| {
+            check(unsafe { sys::cudnn_fe_graph_build_plan_at_index(self.raw, handle, index) })
+        })
+    }
+
     pub fn deselect_workspace_greater_than(&self, workspace: usize) -> &Self {
         let workspace = i64::try_from(workspace).expect("workspace size does not fit in i64");
         check(unsafe { sys::cudnn_fe_graph_deselect_workspace_greater_than(self.raw, workspace) })
@@ -567,20 +574,20 @@ impl<'h> GraphBuilder<'h> {
     }
 
     pub fn plan_name_at_index(&self, index: usize) -> Result<String> {
-        let mut buf = vec![0u8; 256];
-        check(unsafe {
-            sys::cudnn_fe_graph_get_plan_name_at_index(
-                self.raw,
-                i64::try_from(index).unwrap(),
-                buf.as_mut_ptr() as *mut std::os::raw::c_char,
-                buf.len(),
-            )
-        })?;
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+        plan_name_at_index(self.raw, index)
     }
 
+    /// Validates, builds and selects execution plans, returning an executable graph.
     pub fn build(self, modes: &[HeurMode]) -> Result<BuiltGraph> {
+        self.build_with_policy(modes, BuildPlanPolicy::HeuristicsChoice)
+    }
+
+    /// Like [`Self::build`] but with an explicit plan build policy. 
+    pub fn build_with_policy(
+        self,
+        modes: &[HeurMode],
+        policy: BuildPlanPolicy,
+    ) -> Result<BuiltGraph> {
         if self.override_shape_enabled.get() && backend_version() < 92100 {
             return Err(Error {
                 code: ErrorCode::GraphNotSupported,
@@ -593,7 +600,15 @@ impl<'h> GraphBuilder<'h> {
         }
         let raw: Vec<sys::cudnnFeHeurMode> = modes.iter().map(|m| m.to_ffi()).collect();
         self.handle.with_ptr(|handle| {
-            check(unsafe { sys::cudnn_fe_graph_build(self.raw, handle, raw.as_ptr(), raw.len()) })
+            check(unsafe {
+                sys::cudnn_fe_graph_build(
+                    self.raw,
+                    handle,
+                    raw.as_ptr(),
+                    raw.len(),
+                    policy.to_ffi(),
+                )
+            })
         })?;
 
         let tensors = self.collect_tensor_requirements();
@@ -671,11 +686,76 @@ impl BuiltGraph {
         self.override_shape_enabled
     }
 
-    /// Workspace size for the shapes the graph was built with.
+    /// Workspace size of the candidate plan for the shapes the graph was built with.
     pub fn workspace_size(&self) -> usize {
         let mut out = 0;
         check(unsafe { sys::cudnn_fe_graph_get_workspace_size(self.raw, &mut out) }).unwrap();
         usize::try_from(out).expect("cuDNN returned a negative workspace size")
+    }
+
+    /// Largest workspace size over all built plans, for the shapes the graph was
+    /// built with. A workspace this large suffices for [`ExecutionPlan::execute`]
+    /// on any built plan.
+    pub fn max_workspace_size(&self) -> usize {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_graph_get_max_workspace_size(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).expect("cuDNN returned a negative workspace size")
+    }
+
+    /// Number of execution plans the heuristics returned (built or not).
+    pub fn execution_plan_count(&self) -> usize {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_graph_get_execution_plan_count(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).unwrap()
+    }
+
+    /// Total number of engines cuDNN has for this operation graph, whether or not
+    /// the heuristics proposed them. Valid engine ids are `0..engine_count()`.
+    pub fn engine_count(&self) -> usize {
+        let mut out = 0;
+        check(unsafe { sys::cudnn_fe_graph_get_engine_count(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).unwrap()
+    }
+
+    /// Knobs (and their ranges) supported by a global engine id.
+    pub fn knobs_for_engine(&self, engine_id: usize) -> Result<Vec<Knob>> {
+        let engine_id = i64::try_from(engine_id).expect("engine id does not fit in i64");
+        let raw = read_array(|buf, cap, len| unsafe {
+            sys::cudnn_fe_graph_get_knobs_for_engine(self.raw, engine_id, buf, cap, len)
+        })?;
+        Ok(raw
+            .into_iter()
+            .map(|k| Knob {
+                knob_type: knob_type_from_ffi(k.type_),
+                min_value: k.min_value,
+                max_value: k.max_value,
+                stride: k.stride,
+            })
+            .collect())
+    }
+
+    /// Index of the plan [`Self::execute`] runs.
+    pub fn candidate_plan_index(&self) -> usize {
+        let mut out = -1;
+        check(unsafe { sys::cudnn_fe_graph_get_candidate_plan_index(self.raw, &mut out) }).unwrap();
+        usize::try_from(out).expect("a built graph always has a candidate plan")
+    }
+
+    /// The plan [`Self::execute`] runs.
+    pub fn candidate_plan(&self) -> ExecutionPlan<'_> {
+        ExecutionPlan {
+            graph: self,
+            index: self.candidate_plan_index(),
+        }
+    }
+
+    pub fn plan(&self, index: usize) -> Option<ExecutionPlan<'_>> {
+        (index < self.execution_plan_count()).then_some(ExecutionPlan { graph: self, index })
+    }
+
+    /// All plans in heuristics priority order.
+    pub fn plans(&self) -> impl ExactSizeIterator<Item = ExecutionPlan<'_>> + '_ {
+        (0..self.execution_plan_count()).map(move |index| ExecutionPlan { graph: self, index })
     }
 
     /// Workspace size for the shapes bound in `variant_pack`.
@@ -741,6 +821,8 @@ impl BuiltGraph {
         })
     }
 
+    /// Runs a specific built plan.
+    ///
     /// # Safety
     /// All provided device pointers must match cuDNN expectations.
     pub unsafe fn execute_plan_at_index(
@@ -785,6 +867,246 @@ unsafe impl Sync for BuiltGraph {}
 impl Drop for BuiltGraph {
     fn drop(&mut self) {
         unsafe { sys::cudnn_fe_graph_destroy(self.raw) };
+    }
+}
+
+/// A tunable engine parameter and its allowed range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Knob {
+    pub knob_type: KnobType,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub stride: i64,
+}
+
+/// A knob value chosen for a particular plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnobChoice {
+    pub knob_type: KnobType,
+    pub value: i64,
+}
+
+/// The engine and knob choices a plan is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineConfig {
+    /// Global engine id; see [`BuiltGraph::knobs_for_engine`].
+    pub engine_id: usize,
+    pub knobs: Vec<KnobChoice>,
+}
+
+/// One of the execution plans of a [`BuiltGraph`], as returned by the heuristics.
+#[derive(Clone, Copy)]
+pub struct ExecutionPlan<'a> {
+    graph: &'a BuiltGraph,
+    index: usize,
+}
+
+impl<'a> ExecutionPlan<'a> {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn graph(&self) -> &'a BuiltGraph {
+        self.graph
+    }
+
+    fn ffi_index(&self) -> i64 {
+        i64::try_from(self.index).expect("plan index does not fit in i64")
+    }
+
+    /// Engine tag such as `eng0_k2=3_k4=1`.
+    pub fn name(&self) -> String {
+        plan_name_at_index(self.graph.raw, self.index).unwrap()
+    }
+
+    /// Whether cuDNN built this plan. Only built plans can report a workspace
+    /// size or execute.
+    pub fn is_built(&self) -> bool {
+        let mut out = 0;
+        check(unsafe {
+            sys::cudnn_fe_graph_is_plan_built_at_index(self.graph.raw, self.ffi_index(), &mut out)
+        })
+        .unwrap();
+        out != 0
+    }
+
+    pub fn is_candidate(&self) -> bool {
+        self.index == self.graph.candidate_plan_index()
+    }
+
+    pub fn engine_config(&self) -> Result<EngineConfig> {
+        let mut engine_id = -1i64;
+        let raw = read_array(|buf, cap, len| unsafe {
+            sys::cudnn_fe_graph_get_plan_engine_and_knobs_at_index(
+                self.graph.raw,
+                self.ffi_index(),
+                &mut engine_id,
+                buf,
+                cap,
+                len,
+            )
+        })?;
+        Ok(EngineConfig {
+            engine_id: usize::try_from(engine_id).expect("cuDNN returned a negative engine id"),
+            knobs: raw
+                .into_iter()
+                .map(|k| KnobChoice {
+                    knob_type: knob_type_from_ffi(k.type_),
+                    value: k.value,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn behavior_notes(&self) -> Vec<BehaviorNote> {
+        read_array(|buf, cap, len| unsafe {
+            sys::cudnn_fe_graph_get_plan_behavior_notes_at_index(
+                self.graph.raw,
+                self.ffi_index(),
+                buf,
+                cap,
+                len,
+            )
+        })
+        .unwrap()
+        .into_iter()
+        .map(|n| BehaviorNote::from_ffi(n).expect("unknown behavior note from cudnn-frontend"))
+        .collect()
+    }
+
+    pub fn numerical_notes(&self) -> Vec<NumericalNote> {
+        read_array(|buf, cap, len| unsafe {
+            sys::cudnn_fe_graph_get_plan_numerical_notes_at_index(
+                self.graph.raw,
+                self.ffi_index(),
+                buf,
+                cap,
+                len,
+            )
+        })
+        .unwrap()
+        .into_iter()
+        .map(|n| NumericalNote::from_ffi(n).expect("unknown numerical note from cudnn-frontend"))
+        .collect()
+    }
+
+    /// Workspace size for the shapes the graph was built with. Fails if the plan
+    /// was not built.
+    pub fn workspace_size(&self) -> Result<usize> {
+        let mut out = 0;
+        check(unsafe {
+            sys::cudnn_fe_graph_get_plan_workspace_size_at_index(
+                self.graph.raw,
+                ptr::null_mut(),
+                self.ffi_index(),
+                ptr::null(),
+                0,
+                &mut out,
+            )
+        })?;
+        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
+    }
+
+    /// Workspace size for the shapes bound in `variant_pack`. Fails if the plan
+    /// was not built.
+    pub fn workspace_size_for(&self, variant_pack: &VariantPack) -> Result<usize> {
+        assert_eq!(variant_pack.graph.id, self.graph.id);
+        if !variant_pack.has_shape_overrides() {
+            return self.workspace_size();
+        }
+        if backend_version() < 92300 {
+            return Err(Error {
+                code: ErrorCode::GraphNotSupported,
+                message: format!(
+                    "querying the workspace size for override shapes requires cuDNN backend \
+                     9.23.0 or newer, but the loaded backend is version {}",
+                    backend_version()
+                ),
+            });
+        }
+        let overrides = variant_pack.ffi_overrides();
+        let mut out = 0;
+        variant_pack.handle.with_ptr(|handle| {
+            check(unsafe {
+                sys::cudnn_fe_graph_get_plan_workspace_size_at_index(
+                    self.graph.raw,
+                    handle,
+                    self.ffi_index(),
+                    overrides.as_ptr(),
+                    overrides.len(),
+                    &mut out,
+                )
+            })
+        })?;
+        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
+    }
+
+    /// Runs this plan. Fails if the plan was not built.
+    ///
+    /// # Safety
+    /// All provided device pointers must match cuDNN expectations.
+    pub unsafe fn execute(
+        &self,
+        variant_pack: &VariantPack,
+        workspace: &mut impl DeviceVisibleMemoryMut,
+    ) -> Result<()> {
+        unsafe {
+            self.graph
+                .execute_plan_at_index(variant_pack, workspace, self.index)
+        }
+    }
+}
+
+impl std::fmt::Debug for ExecutionPlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionPlan")
+            .field("index", &self.index)
+            .field("name", &self.name())
+            .field("is_built", &self.is_built())
+            .field("behavior_notes", &self.behavior_notes())
+            .field("numerical_notes", &self.numerical_notes())
+            .finish()
+    }
+}
+
+fn knob_type_from_ffi(raw: sys::cudnnFeKnobType) -> KnobType {
+    KnobType::from_ffi(raw).expect("unknown knob type from cudnn-frontend")
+}
+
+fn plan_name_at_index(raw: *mut sys::cudnnFeGraph, index: usize) -> Result<String> {
+    let index = i64::try_from(index).expect("plan index does not fit in i64");
+    let mut buf = vec![0u8; 256];
+    let mut len = 0usize;
+    loop {
+        check(unsafe {
+            sys::cudnn_fe_graph_get_plan_name_at_index(
+                raw,
+                index,
+                buf.as_mut_ptr().cast::<std::os::raw::c_char>(),
+                buf.len(),
+                &mut len,
+            )
+        })?;
+        if len < buf.len() {
+            buf.truncate(len);
+            return Ok(String::from_utf8_lossy(&buf).into_owned());
+        }
+        buf = vec![0u8; len + 1];
+    }
+}
+
+fn read_array<T: Copy>(mut query: impl FnMut(*mut T, usize, *mut usize) -> i32) -> Result<Vec<T>> {
+    // `T` is always a plain C struct or enum from the shim, for which zero is valid.
+    let zeroed = |n| vec![unsafe { mem::zeroed::<T>() }; n];
+    let mut buf = zeroed(16);
+    loop {
+        let mut len = 0usize;
+        check(query(buf.as_mut_ptr(), buf.len(), &mut len))?;
+        if len <= buf.len() {
+            buf.truncate(len);
+            return Ok(buf);
+        }
+        buf = zeroed(len);
     }
 }
 
