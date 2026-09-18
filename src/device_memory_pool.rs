@@ -1,4 +1,5 @@
 use crate::{device::Device, device_memory::DeviceMemory, error::Result, stream::Stream};
+use bytesize::ByteSize;
 use cudarc::driver::sys::{
     CUmemAllocationHandleType, CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
     CUmemLocation_st, CUmemLocation_st__bindgen_ty_1,
@@ -80,6 +81,10 @@ impl DeviceMemoryPool {
                 .compare_exchange_weak(peak, new_allocated, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                tracing::debug!(
+                    "new allocated device memory peak: {}",
+                    ByteSize::b(new_allocated as u64)
+                );
                 break;
             }
         }

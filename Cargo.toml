@@ -18,3 +18,5 @@ bytemuck = "1.25"
 range-alloc = "0.1.5"
 bumpalo = "3.20"
 half = { version = "2.7", features = ["bytemuck"] }
+tracing = "0.1"
+bytesize = "2.7"
