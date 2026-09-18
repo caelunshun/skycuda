@@ -582,7 +582,7 @@ impl<'h> GraphBuilder<'h> {
         self.build_with_policy(modes, BuildPlanPolicy::HeuristicsChoice)
     }
 
-    /// Like [`Self::build`] but with an explicit plan build policy. 
+    /// Like [`Self::build`] but with an explicit plan build policy.
     pub fn build_with_policy(
         self,
         modes: &[HeurMode],
@@ -790,6 +790,61 @@ impl BuiltGraph {
         Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
     }
 
+    /// Workspace size of the plan at `index`, for the shapes the graph was built
+    /// with. Fails if the plan was not built.
+    pub fn workspace_size_at_index(&self, index: usize) -> Result<usize> {
+        let mut out = 0;
+        check(unsafe {
+            sys::cudnn_fe_graph_get_plan_workspace_size_at_index(
+                self.raw,
+                ptr::null_mut(),
+                i64::try_from(index).expect("plan index does not fit in i64"),
+                ptr::null(),
+                0,
+                &mut out,
+            )
+        })?;
+        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
+    }
+
+    /// Workspace size of the plan at `index`, for the shapes bound in
+    /// `variant_pack`. Fails if the plan was not built.
+    pub fn workspace_size_at_index_for(
+        &self,
+        index: usize,
+        variant_pack: &VariantPack,
+    ) -> Result<usize> {
+        assert_eq!(variant_pack.graph.id, self.id);
+        if !variant_pack.has_shape_overrides() {
+            return self.workspace_size_at_index(index);
+        }
+        if backend_version() < 92300 {
+            return Err(Error {
+                code: ErrorCode::GraphNotSupported,
+                message: format!(
+                    "querying the workspace size for override shapes requires cuDNN backend \
+                     9.23.0 or newer, but the loaded backend is version {}",
+                    backend_version()
+                ),
+            });
+        }
+        let overrides = variant_pack.ffi_overrides();
+        let mut out = 0;
+        variant_pack.handle.with_ptr(|handle| {
+            check(unsafe {
+                sys::cudnn_fe_graph_get_plan_workspace_size_at_index(
+                    self.raw,
+                    handle,
+                    i64::try_from(index).expect("plan index does not fit in i64"),
+                    overrides.as_ptr(),
+                    overrides.len(),
+                    &mut out,
+                )
+            })
+        })?;
+        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
+    }
+
     pub fn new_variant_pack<'a>(&'a self, handle: &'a CudnnHandle) -> VariantPack<'a> {
         VariantPack::new(self, handle)
     }
@@ -894,7 +949,7 @@ pub struct EngineConfig {
     pub knobs: Vec<KnobChoice>,
 }
 
-/// One of the execution plans of a [`BuiltGraph`], as returned by the heuristics.
+/// One of the execution plans of a [`BuiltGraph`].
 #[derive(Clone, Copy)]
 pub struct ExecutionPlan<'a> {
     graph: &'a BuiltGraph,
@@ -993,52 +1048,14 @@ impl<'a> ExecutionPlan<'a> {
     /// Workspace size for the shapes the graph was built with. Fails if the plan
     /// was not built.
     pub fn workspace_size(&self) -> Result<usize> {
-        let mut out = 0;
-        check(unsafe {
-            sys::cudnn_fe_graph_get_plan_workspace_size_at_index(
-                self.graph.raw,
-                ptr::null_mut(),
-                self.ffi_index(),
-                ptr::null(),
-                0,
-                &mut out,
-            )
-        })?;
-        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
+        self.graph.workspace_size_at_index(self.index)
     }
 
     /// Workspace size for the shapes bound in `variant_pack`. Fails if the plan
     /// was not built.
     pub fn workspace_size_for(&self, variant_pack: &VariantPack) -> Result<usize> {
-        assert_eq!(variant_pack.graph.id, self.graph.id);
-        if !variant_pack.has_shape_overrides() {
-            return self.workspace_size();
-        }
-        if backend_version() < 92300 {
-            return Err(Error {
-                code: ErrorCode::GraphNotSupported,
-                message: format!(
-                    "querying the workspace size for override shapes requires cuDNN backend \
-                     9.23.0 or newer, but the loaded backend is version {}",
-                    backend_version()
-                ),
-            });
-        }
-        let overrides = variant_pack.ffi_overrides();
-        let mut out = 0;
-        variant_pack.handle.with_ptr(|handle| {
-            check(unsafe {
-                sys::cudnn_fe_graph_get_plan_workspace_size_at_index(
-                    self.graph.raw,
-                    handle,
-                    self.ffi_index(),
-                    overrides.as_ptr(),
-                    overrides.len(),
-                    &mut out,
-                )
-            })
-        })?;
-        Ok(usize::try_from(out).expect("cuDNN returned a negative workspace size"))
+        self.graph
+            .workspace_size_at_index_for(self.index, variant_pack)
     }
 
     /// Runs this plan. Fails if the plan was not built.
