@@ -72,7 +72,7 @@ impl DeviceMemoryPool {
         let new_allocated = prev_allocated + bytes;
         loop {
             let peak = self.0.peak_allocated_bytes.load(Ordering::Relaxed);
-            if peak > new_allocated {
+            if peak >= new_allocated {
                 break;
             }
             if self
