@@ -1,6 +1,7 @@
 use crate::{device::Device, error::Result, module::Module};
 use cudarc::driver::sys::{
-    CUfunction, cuFuncGetParamCount, cuFuncGetParamInfo, cuFuncLoad, cuModuleGetFunction,
+    CUfunction, CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+    cuFuncGetParamCount, cuFuncGetParamInfo, cuFuncLoad, cuFuncSetAttribute, cuModuleGetFunction,
     cuOccupancyMaxActiveBlocksPerMultiprocessor,
 };
 use std::{ffi::CString, ptr, sync::Arc};
@@ -57,6 +58,18 @@ impl Function {
 
     pub fn cu_function(&self) -> CUfunction {
         self.0.cu_function
+    }
+
+    pub fn set_max_dynamic_smem(&self, max_bytes: usize) -> Result<()> {
+        unsafe {
+            cuFuncSetAttribute(
+                self.cu_function(),
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                max_bytes.try_into()?,
+            )
+            .result()?;
+        }
+        Ok(())
     }
 
     pub fn max_active_blocks_per_sm(&self, block_size: u32, dynamic_smem: usize) -> Result<usize> {
