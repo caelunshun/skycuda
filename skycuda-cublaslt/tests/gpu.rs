@@ -983,6 +983,89 @@ fn algorithm_introspection() {
     plan.check(&rebuilt).unwrap();
 }
 
+/// A plan built for one shape runs another, reusing its algorithms.
+#[test]
+fn reshape_to_another_size() {
+    let f = Fixture::new();
+    let layout = |rows: usize, cols: usize| {
+        MatrixLayout::new(DataType::F32, rows as u64, cols as u64, rows as i64)
+    };
+    let desc = |m: usize, n: usize, k: usize| {
+        MatmulDesc::new(ComputeType::F32, layout(m, k), layout(k, n), layout(m, n))
+    };
+
+    let plan = f.handle.build_plan(&desc(64, 48, 32), &pref()).unwrap();
+
+    let (m, n, k) = (96usize, 32usize, 64usize);
+    let reshaped = plan.reshape(&desc(m, n, k)).unwrap();
+    assert_eq!(reshaped.desc().d.rows, m as u64);
+
+    let (a, b) = (Mat::generated(m, k, 3), Mat::generated(k, n, 4));
+    let a_mem = f.upload(&a.to_col_major(m));
+    let b_mem = f.upload(&b.to_col_major(k));
+    let mut d_mem = f.zeroed::<f32>(m * n);
+    let mut workspace = f.workspace(&reshaped);
+
+    {
+        let mut ops = reshaped.operands();
+        ops.a(&a_mem).b(&b_mem).d(&mut d_mem);
+        unsafe { reshaped.execute(&f.stream, &ops, &mut workspace).unwrap() };
+    }
+
+    let got = Mat::from_col_major(m, n, m, &read::<f32>(&mut d_mem));
+    assert_close(&got, &a.matmul(&b), 1e-3);
+}
+
+/// Batching is part of the shape, so it may change too.
+#[test]
+fn reshape_to_batched() {
+    let f = Fixture::new();
+    let (m, n, k, batch) = (32usize, 24usize, 16usize, 3usize);
+    let layout = |rows: usize, cols: usize| {
+        MatrixLayout::new(DataType::F32, rows as u64, cols as u64, rows as i64)
+    };
+    let batched =
+        |rows: usize, cols: usize| layout(rows, cols).batched(batch as i32, (rows * cols) as i64);
+
+    let desc = MatmulDesc::new(ComputeType::F32, layout(m, k), layout(k, n), layout(m, n));
+    let plan = f.handle.build_plan(&desc, &pref()).unwrap();
+
+    let reshaped = plan
+        .reshape(&MatmulDesc::new(
+            ComputeType::F32,
+            batched(m, k),
+            batched(k, n),
+            batched(m, n),
+        ))
+        .unwrap();
+
+    let mats: Vec<(Mat, Mat)> = (0..batch)
+        .map(|i| (Mat::generated(m, k, i + 5), Mat::generated(k, n, i + 9)))
+        .collect();
+    let mut a_host = Vec::new();
+    let mut b_host = Vec::new();
+    for (a, b) in &mats {
+        a_host.extend(a.to_col_major(m));
+        b_host.extend(b.to_col_major(k));
+    }
+    let a_mem = f.upload(&a_host);
+    let b_mem = f.upload(&b_host);
+    let mut d_mem = f.zeroed::<f32>(m * n * batch);
+    let mut workspace = f.workspace(&reshaped);
+
+    {
+        let mut ops = reshaped.operands();
+        ops.a(&a_mem).b(&b_mem).d(&mut d_mem);
+        unsafe { reshaped.execute(&f.stream, &ops, &mut workspace).unwrap() };
+    }
+
+    let d = read::<f32>(&mut d_mem);
+    for (i, (a, b)) in mats.iter().enumerate() {
+        let got = Mat::from_col_major(m, n, m, &d[i * m * n..(i + 1) * m * n]);
+        assert_close(&got, &a.matmul(b), 1e-3);
+    }
+}
+
 // ------------------------------------------------------------- misuse panics
 
 /// Builds a plain 32x32x32 f32 plan for the misuse tests.
@@ -1013,6 +1096,21 @@ fn rejects_missing_d() {
     let mut ops = plan.operands();
     ops.a(&a_mem).b(&b_mem);
     unsafe { plan.execute(&f.stream, &ops, &mut workspace).unwrap() };
+}
+
+#[test]
+#[should_panic(expected = "cannot change")]
+fn rejects_reshape_with_different_type() {
+    let f = Fixture::new();
+    let plan = simple_plan(&f);
+    let layout = MatrixLayout::new(DataType::F32, 64, 64, 64);
+    let desc = MatmulDesc::new(
+        ComputeType::F32,
+        layout,
+        layout,
+        MatrixLayout::new(DataType::F16, 64, 64, 64),
+    );
+    let _ = plan.reshape(&desc);
 }
 
 #[test]

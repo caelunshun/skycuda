@@ -28,7 +28,8 @@ use std::{cell::RefCell, ffi::c_void, fmt, mem::MaybeUninit, ptr, sync::Mutex};
 ///
 /// Build one with
 /// [`CublasLtHandle::build_plan`](crate::CublasLtHandle::build_plan) and reuse
-/// it for every call with the same shapes and types.
+/// it for every call with the same shapes and types. [`Self::reshape`] adapts
+/// it to a new shape without running the heuristic again.
 pub struct MatmulPlan {
     handle: CublasLtHandle,
     desc: MatmulDesc,
@@ -118,25 +119,11 @@ impl MatmulPlan {
             .collect();
 
         if algorithms.is_empty() {
-            return Err(Error::with_message(
-                Status::NotSupported,
+            return Err(no_algorithm_error(
                 "cublasLtMatmulAlgoGetHeuristic",
-                format!(
-                    "cuBLASLt has no algorithm for this problem: compute {:?}, scale {:?}, \
-                     A {:?}{:?}, B {:?}{:?}, C {:?}, D {:?}, epilogue {:?}, scales {:?}, \
-                     workspace <= {} bytes",
-                    desc.compute_type,
-                    desc.scale_type,
-                    desc.trans_a,
-                    desc.a,
-                    desc.trans_b,
-                    desc.b,
-                    desc.c_layout(),
-                    desc.d,
-                    desc.epilogue,
-                    desc.scales,
-                    pref.resolved_max_workspace_bytes(handle.device().compute_capability_major()),
-                ),
+                desc,
+                pref,
+                handle.device().compute_capability_major(),
             ));
         }
 
@@ -149,6 +136,97 @@ impl MatmulPlan {
             c,
             d,
             pref: pref.clone(),
+            algorithms,
+        })
+    }
+
+    /// Rebuilds the plan for a different problem shape, reusing the algorithms
+    /// the heuristic already chose instead of running it again.
+    ///
+    /// Only the shape may change: the matrix dimensions, leading dimensions,
+    /// batching, and the auxiliary/bias/scalar batch strides. Everything the
+    /// algorithm was selected for — the data types, orders, transposes,
+    /// epilogue, scaling modes and the preference — must match, and a mismatch
+    /// panics.
+    ///
+    /// Every algorithm is re-checked against the new shape; those cuBLASLt
+    /// rejects, or whose workspace no longer fits the preference's budget, are
+    /// dropped, and the rest have their workspace size and wave count
+    /// refreshed. Returns [`Status::NotSupported`] if none survive, in which
+    /// case the shape needs its own
+    /// [`build_plan`](crate::CublasLtHandle::build_plan).
+    pub fn reshape(&self, desc: &MatmulDesc) -> Result<MatmulPlan> {
+        if let Some(field) = incompatible_field(&self.desc, desc) {
+            panic!("reshaping a plan cannot change {field}; build a new plan instead");
+        }
+
+        self.handle.device().set_as_current()?;
+
+        let a = RawMatrixLayout::new(&desc.a)?;
+        let b = RawMatrixLayout::new(&desc.b)?;
+        let c = RawMatrixLayout::new(desc.c_layout())?;
+        let d = RawMatrixLayout::new(&desc.d)?;
+        let mut raw_desc = RawMatmulDesc::new(desc)?;
+
+        // As in `build`: the check reads the pointer attributes' values to
+        // infer alignment, so give them the alignment the preference promises.
+        let placeholder = u64::from(self.pref.aux_alignment_bytes);
+        for attr in required_pointer_attrs(desc) {
+            raw_desc.set_pointer(attr, placeholder)?;
+        }
+
+        let budget = self
+            .pref
+            .resolved_max_workspace_bytes(self.handle.device().compute_capability_major());
+        let mut algorithms = Vec::with_capacity(self.algorithms.len());
+        for algo in &self.algorithms {
+            let mut result: sys::cublasLtMatmulHeuristicResult_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            let status = unsafe {
+                sys::cublasLtMatmulAlgoCheck(
+                    self.handle.raw(),
+                    raw_desc.raw(),
+                    a.raw(),
+                    b.raw(),
+                    c.raw(),
+                    d.raw(),
+                    &algo.raw,
+                    &mut result,
+                )
+            };
+            // An algorithm that cannot run the new shape is reported as a
+            // failing status rather than an error to propagate.
+            if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+                || result.state != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+                || result.workspaceSize > budget
+            {
+                continue;
+            }
+            algorithms.push(Algorithm {
+                raw: algo.raw,
+                workspace_size: result.workspaceSize,
+                waves_count: result.wavesCount,
+            });
+        }
+
+        if algorithms.is_empty() {
+            return Err(no_algorithm_error(
+                "cublasLtMatmulAlgoCheck",
+                desc,
+                &self.pref,
+                self.handle.device().compute_capability_major(),
+            ));
+        }
+
+        Ok(Self {
+            handle: self.handle.clone(),
+            desc: desc.clone(),
+            raw_desc: Mutex::new(raw_desc),
+            a,
+            b,
+            c,
+            d,
+            pref: self.pref.clone(),
             algorithms,
         })
     }
@@ -421,6 +499,88 @@ impl fmt::Debug for MatmulPlan {
             .field("algorithms", &self.algorithms)
             .finish()
     }
+}
+
+/// The first field of `desc` an algorithm was selected for that `other`
+/// changes, if any. Shape — dimensions, leading dimensions, batching and the
+/// strides that follow from them — is deliberately not compared.
+fn incompatible_field(desc: &MatmulDesc, other: &MatmulDesc) -> Option<&'static str> {
+    for (name_type, name_order, lhs, rhs) in [
+        ("A's data type", "A's order", &desc.a, &other.a),
+        ("B's data type", "B's order", &desc.b, &other.b),
+        (
+            "C's data type",
+            "C's order",
+            desc.c_layout(),
+            other.c_layout(),
+        ),
+        ("D's data type", "D's order", &desc.d, &other.d),
+    ] {
+        if lhs.data_type != rhs.data_type {
+            return Some(name_type);
+        }
+        if lhs.order != rhs.order {
+            return Some(name_order);
+        }
+    }
+
+    [
+        ("the compute type", desc.compute_type == other.compute_type),
+        ("the scale type", desc.scale_type == other.scale_type),
+        ("A's transpose", desc.trans_a == other.trans_a),
+        ("B's transpose", desc.trans_b == other.trans_b),
+        (
+            "whether C is separate from D",
+            desc.c.is_some() == other.c.is_some(),
+        ),
+        ("the epilogue", desc.epilogue == other.epilogue),
+        (
+            "the bias data type",
+            desc.bias_data_type == other.bias_data_type,
+        ),
+        (
+            "the auxiliary data type",
+            desc.aux_data_type == other.aux_data_type,
+        ),
+        ("the pointer mode", desc.pointer_mode == other.pointer_mode),
+        ("fast accumulation", desc.fast_accum == other.fast_accum),
+        (
+            "the SM count target",
+            desc.sm_count_target == other.sm_count_target,
+        ),
+        ("the scaling modes", desc.scales == other.scales),
+    ]
+    .into_iter()
+    .find(|(_, same)| !same)
+    .map(|(what, _)| what)
+}
+
+fn no_algorithm_error(
+    call: &'static str,
+    desc: &MatmulDesc,
+    pref: &MatmulPreference,
+    compute_capability_major: u32,
+) -> Error {
+    Error::with_message(
+        Status::NotSupported,
+        call,
+        format!(
+            "cuBLASLt has no algorithm for this problem: compute {:?}, scale {:?}, \
+             A {:?}{:?}, B {:?}{:?}, C {:?}, D {:?}, epilogue {:?}, scales {:?}, \
+             workspace <= {} bytes",
+            desc.compute_type,
+            desc.scale_type,
+            desc.trans_a,
+            desc.a,
+            desc.trans_b,
+            desc.b,
+            desc.c_layout(),
+            desc.d,
+            desc.epilogue,
+            desc.scales,
+            pref.resolved_max_workspace_bytes(compute_capability_major),
+        ),
+    )
 }
 
 fn assert_aligned(slot: Slot, ptr: u64, align: u32) {
