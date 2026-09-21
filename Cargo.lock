@@ -320,6 +320,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "skycuda-cublaslt"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cudarc",
+ "half",
+ "skycuda",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "skycuda-cudnn"
 version = "0.1.0"
 dependencies = [

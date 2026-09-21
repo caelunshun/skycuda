@@ -4,15 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = [".", "skycuda-cudnn", "skycuda-cudnn-sys"]
+members = [".", "skycuda-cublaslt", "skycuda-cudnn", "skycuda-cudnn-sys"]
 
-[dependencies]
+[workspace.dependencies]
 cudarc = { git = "https://github.com/caelunshun/cudarc", branch = "cuda-13-4", default-features = false, features = [
     "cuda-version-from-build-system",
     "dynamic-loading",
     "driver",
     "std",
 ] }
+
+[dependencies]
+cudarc = { workspace = true }
 thiserror = "2.0"
 bytemuck = "1.25"
 range-alloc = "0.1.5"
