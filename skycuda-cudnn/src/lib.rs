@@ -1167,6 +1167,22 @@ pub(crate) fn cstr(s: Option<&str>) -> (Option<CString>, *const std::os::raw::c_
 /// Adding an entry panics if the uid is not a non-virtual tensor of the graph,
 /// was already added, is written by the graph but added via [`add`](Self::add),
 /// or the allocation is shorter than the tensor's extent (when determinable).
+///
+/// # Aliasing
+///
+/// cuDNN allows one allocation to back several tensors of the same graph. A
+/// read-only allocation can simply be passed to [`add`](Self::add) once per uid.
+/// A mutable allocation is exclusively borrowed by [`add_mut`](Self::add_mut),
+/// so binding it to several uids (e.g. for an in-place op, or an output that
+/// also serves as an input) goes through [`add_mut_many`](Self::add_mut_many)
+/// or [`add_mut_many_with_shape`](Self::add_mut_many_with_shape).
+///
+/// Aliasing is memory-safe but not checked for correctness: every access stays
+/// within the allocation, but if the graph writes an aliased tensor while it
+/// still needs to read another tensor stored at overlapping addresses, the
+/// result is corrupted output rather than undefined behavior. Only alias
+/// tensors for which cuDNN documents in-place support (typically elementwise
+/// ops whose input and output share dims and strides).
 pub struct VariantPack<'a> {
     graph: &'a BuiltGraph,
     handle: &'a CudnnHandle,
@@ -1309,6 +1325,52 @@ impl<'a> VariantPack<'a> {
         Ok(self)
     }
 
+    /// Binds one mutable allocation to every uid in `ids`.
+    ///
+    /// See the [aliasing](Self#aliasing) notes: this is permitted by cuDNN, but
+    /// aliasing tensors that the graph does not support operating on in place
+    /// yields corrupted output.
+    pub fn add_mut_many(
+        &mut self,
+        ids: &[TensorId],
+        memory: &'a mut impl DeviceVisibleMemoryMut,
+    ) -> skycuda::error::Result<&mut Self> {
+        assert!(!ids.is_empty(), "add_mut_many requires at least one uid");
+        for &id in ids {
+            self.validate(id, memory.len(), true, None);
+        }
+        let mut guard = memory.access_mut_on(&self.handle.1)?;
+        let ptr = unsafe { guard.ptr() };
+        self.record_many(ids.iter().map(|&id| (id, None)), ptr, Box::new(guard));
+        Ok(self)
+    }
+
+    /// Like [`add_mut_many`](Self::add_mut_many), with a runtime `(dim, stride)`
+    /// for each uid.
+    pub fn add_mut_many_with_shape(
+        &mut self,
+        bindings: &[(TensorId, &[usize], &[usize])],
+        memory: &'a mut impl DeviceVisibleMemoryMut,
+    ) -> skycuda::error::Result<&mut Self> {
+        assert!(
+            !bindings.is_empty(),
+            "add_mut_many_with_shape requires at least one uid"
+        );
+        for &(id, dim, stride) in bindings {
+            self.validate(id, memory.len(), true, Some((dim, stride)));
+        }
+        let mut guard = memory.access_mut_on(&self.handle.1)?;
+        let ptr = unsafe { guard.ptr() };
+        self.record_many(
+            bindings
+                .iter()
+                .map(|&(id, dim, stride)| (id, Some((dim, stride)))),
+            ptr,
+            Box::new(guard),
+        );
+        Ok(self)
+    }
+
     fn record(
         &mut self,
         id: TensorId,
@@ -1316,12 +1378,28 @@ impl<'a> VariantPack<'a> {
         guard: Box<dyn Anything + 'a>,
         shape: Option<(&[usize], &[usize])>,
     ) {
-        self.entry_ids.push(id);
-        self.entry_ptrs.push(ptr);
-        self.entry_guards.push(guard);
-        if let Some((dim, stride)) = shape {
-            self.shape_overrides
-                .push((id, to_ffi_dims(dim), to_ffi_dims(stride)));
+        self.record_many(std::iter::once((id, shape)), ptr, guard);
+    }
+
+    /// Records several uids sharing one pointer, kept alive by a single guard.
+    fn record_many<'s>(
+        &mut self,
+        entries: impl Iterator<Item = (TensorId, Option<(&'s [usize], &'s [usize])>)>,
+        ptr: CUdeviceptr_v2,
+        guard: Box<dyn Anything + 'a>,
+    ) {
+        for (id, shape) in entries {
+            assert!(
+                !self.entry_ids.contains(&id),
+                "tensor uid {id} was already added to this variant pack"
+            );
+            self.entry_ids.push(id);
+            self.entry_ptrs.push(ptr);
+            if let Some((dim, stride)) = shape {
+                self.shape_overrides
+                    .push((id, to_ffi_dims(dim), to_ffi_dims(stride)));
+            }
         }
+        self.entry_guards.push(guard);
     }
 }

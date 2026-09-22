@@ -5,7 +5,7 @@ use skycuda::{
 };
 use skycuda_cudnn::{
     BuildPlanPolicy, BuiltGraph, CudnnHandle, DataType, GraphBuilder, HeurMode, MatmulAttributes,
-    TensorAttributes, TensorId, backend_version,
+    PointwiseAttributes, PointwiseMode, TensorAttributes, TensorId, backend_version,
 };
 
 #[test]
@@ -240,6 +240,67 @@ fn variant_pack_rejects_duplicate_uid() {
     pack.add(TensorId(1), &a_memory)
         .unwrap()
         .add(TensorId(1), &a_memory)
+        .unwrap();
+}
+
+/// Elementwise ReLU over `n` floats laid out as an NHWC `[1, n/64, 8, 8]` tensor.
+fn build_relu_graph(handle: &CudnnHandle, n: usize) -> BuiltGraph {
+    assert_eq!(n % 64, 0);
+    let c = n / 64;
+    let graph = GraphBuilder::new(handle).unwrap();
+    graph.set_io_data_type(DataType::Float);
+    graph.set_intermediate_data_type(DataType::Float);
+    graph.set_compute_data_type(DataType::Float);
+    let x = graph
+        .tensor(&TensorAttributes::new(&[1, c, 8, 8], &[n, 1, 8 * c, c]).uid(TensorId(1)))
+        .unwrap();
+    let y = graph
+        .pointwise_unary(x, &PointwiseAttributes::new(PointwiseMode::ReluFwd))
+        .unwrap();
+    y.set_output(true);
+    y.set_uid(TensorId(2));
+    graph.validate().unwrap();
+    graph.build(&[HeurMode::A, HeurMode::B]).unwrap()
+}
+
+#[test]
+fn variant_pack_aliases_one_allocation_to_many_uids() {
+    let (handle, pool) = setup();
+    let n = 256usize;
+    let graph = build_relu_graph(&handle, n);
+
+    let host: Vec<f32> = (0..n).map(|i| i as f32 - 128.0).collect();
+    let mut memory = pool.alloc_zeroed(n * size_of::<f32>()).unwrap();
+    memory
+        .view_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::cast_slice(&host));
+
+    let mut workspace = pool.alloc_zeroed(graph.workspace_size().max(1)).unwrap();
+    {
+        let mut variant_pack = graph.new_variant_pack(&handle);
+        variant_pack
+            .add_mut_many(&[TensorId(1), TensorId(2)], &mut memory)
+            .unwrap();
+        unsafe {
+            graph.execute(&variant_pack, &mut workspace).unwrap();
+        }
+    }
+
+    let out: &[f32] = bytemuck::cast_slice(memory.view_mut().unwrap());
+    let expected: Vec<f32> = host.iter().map(|v| v.max(0.0)).collect();
+    assert_eq!(out, &expected[..]);
+}
+
+#[test]
+#[should_panic(expected = "already added")]
+fn add_mut_many_rejects_duplicate_uid() {
+    let (handle, pool) = setup();
+    let graph = build_relu_graph(&handle, 256);
+    let mut memory = pool.alloc_zeroed(256 * size_of::<f32>()).unwrap();
+    graph
+        .new_variant_pack(&handle)
+        .add_mut_many(&[TensorId(2), TensorId(2)], &mut memory)
         .unwrap();
 }
 
