@@ -16,6 +16,7 @@ use cudarc::driver::sys::{
     CUtensorMapInterleave_enum, CUtensorMapL2promotion_enum, CUtensorMapSwizzle_enum,
     cuTensorMapEncodeTiled,
 };
+use std::{mem::ManuallyDrop, ptr::NonNull};
 
 pub const MAX_RANK: usize = 5;
 
@@ -418,7 +419,7 @@ impl TensorMapDesc {
     }
 
     /// Encodes a tensor map for the given global address without checking
-    /// it against any memory allocation. Prefer [`TensorMap`].
+    /// it against any memory allocation. Prefer [`TensorMap`] or [`TensorMapMut`].
     pub fn encode(&self, address: CUdeviceptr_v2) -> Result<TensorMapRepr> {
         let mut repr = TensorMapRepr::zeroed();
         unsafe {
@@ -462,12 +463,21 @@ const _: () = assert!(size_of::<TensorMapRepr>() == 128);
 unsafe impl Zeroable for TensorMapRepr {}
 unsafe impl Pod for TensorMapRepr {}
 
-/// A tiled tensor map bound to device-visible memory.
+fn check_footprint(desc: &TensorMapDesc, len: usize) {
+    desc.validate();
+    let footprint = desc.footprint_bytes();
+    assert!(
+        footprint <= len,
+        "tensor map addresses {footprint} bytes, but memory is only {len} bytes",
+    );
+}
+
+/// A read-only tiled tensor map bound to device-visible memory.
 ///
-/// Passing `&TensorMap` to [`LaunchBuilder::arg`](crate::launch::LaunchBuilder::arg)
-/// grants read access (TMA loads); passing `&mut TensorMap` grants write access
-/// (TMA stores and reductions). The descriptor is re-encoded with the
-/// memory's address on every launch. The kernel parameter must be declared as
+/// Passing a `TensorMap` or `&TensorMap` to
+/// [`LaunchBuilder::arg`](crate::launch::LaunchBuilder::arg) grants read access
+/// (TMA loads). The descriptor is re-encoded with the memory's address on every
+/// launch. The kernel parameter must be declared as
 /// `const __grid_constant__ CUtensorMap`.
 #[derive(Debug)]
 pub struct TensorMap<M> {
@@ -481,13 +491,7 @@ where
 {
     /// Panics if the descriptor is invalid or addresses bytes beyond `memory`.
     pub fn new(memory: M, desc: TensorMapDesc) -> Self {
-        desc.validate();
-        let footprint = desc.footprint_bytes();
-        assert!(
-            footprint <= memory.len(),
-            "tensor map addresses {footprint} bytes, but memory is only {} bytes",
-            memory.len()
-        );
+        check_footprint(&desc, memory.len());
         Self { memory, desc }
     }
 
@@ -522,7 +526,61 @@ where
     }
 }
 
-impl<'a, M> KernelArg<'a> for &'a mut TensorMap<M>
+impl<'a, M> KernelArg<'a> for TensorMap<M>
+where
+    M: DeviceVisibleMemory + 'a,
+{
+    type Repr = TensorMapRepr;
+    type Guard = OwnedMemoryGuard<M, M::Guard<'a>>;
+
+    unsafe fn into_arg(self, stream: &'a Stream) -> Result<(Self::Repr, Self::Guard)> {
+        let guard = OwnedMemoryGuard::new(self.memory, |memory| M::access_on(memory, stream))?;
+        let repr = self.desc.encode_checked(unsafe { guard.guard.ptr() })?;
+        Ok((repr, guard))
+    }
+}
+
+/// A writable tiled tensor map bound to device-visible memory.
+///
+/// Passing a `TensorMapMut` or `&mut TensorMapMut` to
+/// [`LaunchBuilder::arg`](crate::launch::LaunchBuilder::arg) grants write access
+/// (TMA stores and reductions) in addition to read access. The descriptor is
+/// re-encoded with the memory's address on every launch. The kernel parameter
+/// must be declared as `const __grid_constant__ CUtensorMap`.
+#[derive(Debug)]
+pub struct TensorMapMut<M> {
+    memory: M,
+    desc: TensorMapDesc,
+}
+
+impl<M> TensorMapMut<M>
+where
+    M: DeviceVisibleMemoryMut,
+{
+    /// Panics if the descriptor is invalid or addresses bytes beyond `memory`.
+    pub fn new(memory: M, desc: TensorMapDesc) -> Self {
+        check_footprint(&desc, memory.len());
+        Self { memory, desc }
+    }
+
+    pub fn desc(&self) -> &TensorMapDesc {
+        &self.desc
+    }
+
+    pub fn into_inner(self) -> M {
+        self.memory
+    }
+
+    pub fn inner(&self) -> &M {
+        &self.memory
+    }
+
+    pub fn inner_mut(&mut self) -> &mut M {
+        &mut self.memory
+    }
+}
+
+impl<'a, M> KernelArg<'a> for &'a mut TensorMapMut<M>
 where
     M: DeviceVisibleMemoryMut + 'a,
 {
@@ -533,5 +591,56 @@ where
         let mut guard = self.memory.access_mut_on(stream)?;
         let repr = self.desc.encode_checked(unsafe { guard.ptr() })?;
         Ok((repr, guard))
+    }
+}
+
+impl<'a, M> KernelArg<'a> for TensorMapMut<M>
+where
+    M: DeviceVisibleMemoryMut + 'a,
+{
+    type Repr = TensorMapRepr;
+    type Guard = OwnedMemoryGuard<M, M::GuardMut<'a>>;
+
+    unsafe fn into_arg(self, stream: &'a Stream) -> Result<(Self::Repr, Self::Guard)> {
+        let mut guard = OwnedMemoryGuard::new(self.memory, |memory| memory.access_mut_on(stream))?;
+        let repr = self.desc.encode_checked(unsafe { guard.guard.ptr() })?;
+        Ok((repr, guard))
+    }
+}
+
+/// Access guard that owns the memory it borrows from. The memory is boxed so
+/// that its address stays stable, and the inner guard is dropped before it.
+pub struct OwnedMemoryGuard<M, G> {
+    guard: ManuallyDrop<G>,
+    memory: NonNull<M>,
+}
+
+impl<M, G> OwnedMemoryGuard<M, G> {
+    fn new<'a>(memory: M, access: impl FnOnce(&'a mut M) -> Result<G>) -> Result<Self>
+    where
+        M: 'a,
+    {
+        let memory = NonNull::from(Box::leak(Box::new(memory)));
+        // SAFETY: `memory` is not freed until after the guard is dropped, and
+        // the reference is never exposed outside of the guard.
+        match access(unsafe { &mut *memory.as_ptr() }) {
+            Ok(guard) => Ok(Self {
+                guard: ManuallyDrop::new(guard),
+                memory,
+            }),
+            Err(e) => {
+                drop(unsafe { Box::from_raw(memory.as_ptr()) });
+                Err(e)
+            }
+        }
+    }
+}
+
+impl<M, G> Drop for OwnedMemoryGuard<M, G> {
+    fn drop(&mut self) {
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+            drop(Box::from_raw(self.memory.as_ptr()));
+        }
     }
 }

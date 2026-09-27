@@ -13,7 +13,7 @@ use skycuda::{
     launch::KernelArg,
     stream::Stream,
     tensor_map::{
-        TensorMap, TensorMapDataType, TensorMapDesc, TensorMapOobFill, TensorMapRepr,
+        TensorMap, TensorMapDataType, TensorMapDesc, TensorMapMut, TensorMapOobFill, TensorMapRepr,
         TensorMapSwizzle,
     },
 };
@@ -122,8 +122,42 @@ fn encode_write() {
         return;
     }
     let mut memory = fx.alloc(F16_MATRIX_FOOTPRINT);
-    let mut map = TensorMap::new(&mut memory, f16_matrix_desc());
+    let mut map = TensorMapMut::new(&mut memory, f16_matrix_desc());
     let (repr, _guard) = unsafe { (&mut map).into_arg(&fx.stream) }.unwrap();
+    assert!(is_nonzero(&repr));
+}
+
+#[test]
+fn encode_owned_read() {
+    let fx = Fixture::new();
+    if !fx.supports_tma() {
+        return;
+    }
+    let map = TensorMap::new(fx.alloc(F16_MATRIX_FOOTPRINT), f16_matrix_desc());
+    let (repr, _guard) = unsafe { map.into_arg(&fx.stream) }.unwrap();
+    assert!(is_nonzero(&repr));
+}
+
+#[test]
+fn encode_owned_write() {
+    let fx = Fixture::new();
+    if !fx.supports_tma() {
+        return;
+    }
+    let map = TensorMapMut::new(fx.alloc(F16_MATRIX_FOOTPRINT), f16_matrix_desc());
+    let (repr, _guard) = unsafe { map.into_arg(&fx.stream) }.unwrap();
+    assert!(is_nonzero(&repr));
+}
+
+#[test]
+fn encode_owned_slice_mut() {
+    let fx = Fixture::new();
+    if !fx.supports_tma() {
+        return;
+    }
+    let mut memory = fx.alloc(F16_MATRIX_FOOTPRINT + 256);
+    let map = TensorMapMut::new(memory.slice_mut(256..), f16_matrix_desc());
+    let (repr, _guard) = unsafe { map.into_arg(&fx.stream) }.unwrap();
     assert!(is_nonzero(&repr));
 }
 
@@ -152,6 +186,10 @@ fn launch_builder_accepts_tensor_map() {
     let memory = fx.alloc(F16_MATRIX_FOOTPRINT);
     let map = TensorMap::new(&memory, f16_matrix_desc());
     fx.stream.launch_builder(&function).arg(&map).unwrap();
+    fx.stream
+        .launch_builder(&function)
+        .arg(TensorMap::new(memory.slice(..), f16_matrix_desc()))
+        .unwrap();
 }
 
 #[test]
