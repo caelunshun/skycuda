@@ -12,5 +12,6 @@ pub mod launch;
 pub mod memory_slice;
 pub mod module;
 pub mod stream;
+pub mod tensor_map;
 
 pub use cudarc;
