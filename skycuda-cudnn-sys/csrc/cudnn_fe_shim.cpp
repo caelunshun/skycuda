@@ -1014,6 +1014,8 @@ cudnn_fe_graph_sdpa(cudnnFeGraph* g, const cudnnFeTensor* q, const cudnnFeTensor
         if (a->has_dropout_prob)
             at.set_dropout(a->dropout_probability, as_t(g, a->dropout_seed), as_t(g, a->dropout_offset));
         at.set_implementation(static_cast<fe::AttentionImplementation_t>(a->implementation));
+        if (a->has_max_total_seq_len_q) at.set_max_total_seq_len_q(a->max_total_seq_len_q);
+        if (a->has_max_total_seq_len_kv) at.set_max_total_seq_len_kv(a->max_total_seq_len_kv);
         if (a->name) at.set_name(a->name);
         emit_outputs(g, g->g->sdpa(as_t(g, q), as_t(g, k), as_t(g, v), at), out, out_len);
         return OK;
@@ -1042,6 +1044,8 @@ cudnn_fe_graph_sdpa_backward(cudnnFeGraph* g, const cudnnFeTensor* q, const cudn
         if (a->has_dropout_prob)
             at.set_dropout(a->dropout_probability, as_t(g, a->dropout_seed), as_t(g, a->dropout_offset));
         if (a->use_deterministic_algorithm) at.set_deterministic_algorithm(true);
+        if (a->has_max_total_seq_len_q) at.set_max_total_seq_len_q(a->max_total_seq_len_q);
+        if (a->has_max_total_seq_len_kv) at.set_max_total_seq_len_kv(a->max_total_seq_len_kv);
         if (a->name) at.set_name(a->name);
         emit_outputs(g, g->g->sdpa_backward(as_t(g, q), as_t(g, k), as_t(g, v), as_t(g, o), as_t(g, dO), as_t(g, stats), at),
                      out, out_len);

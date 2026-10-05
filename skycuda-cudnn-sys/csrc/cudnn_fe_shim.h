@@ -549,6 +549,8 @@ typedef struct cudnnFeSdpaAttrs {
     int32_t has_sliding_window;       int32_t sliding_window_length;
     int32_t has_dropout_prob;   float dropout_probability;
     cudnnFeAttentionImplementation implementation;
+    int32_t has_max_total_seq_len_q;  int64_t max_total_seq_len_q;
+    int32_t has_max_total_seq_len_kv; int64_t max_total_seq_len_kv;
     const char* name;
     /* optional input tensors (nullable) */
     const cudnnFeTensor* bias;
@@ -575,6 +577,8 @@ typedef struct cudnnFeSdpaBackwardAttrs {
     int32_t has_sliding_window;       int32_t sliding_window_length;
     int32_t has_dropout_prob;   float dropout_probability;
     int32_t use_deterministic_algorithm;
+    int32_t has_max_total_seq_len_q;  int64_t max_total_seq_len_q;
+    int32_t has_max_total_seq_len_kv; int64_t max_total_seq_len_kv;
     const char* name;
     const cudnnFeTensor* bias;
     const cudnnFeTensor* dbias;

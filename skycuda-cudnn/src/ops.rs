@@ -6,6 +6,12 @@ use crate::{
 use skycuda_cudnn_sys as sys;
 use std::ptr;
 
+fn max_total_seq_len(v: Option<usize>) -> i64 {
+    v.map_or(0, |v| {
+        i64::try_from(v).expect("max_total_seq_len does not fit in i64")
+    })
+}
+
 unsafe fn collect_outputs<'g, 'h, const N: usize>(
     raw: [*mut sys::cudnnFeTensor; N],
     graph: &'g GraphBuilder<'h>,
@@ -1292,6 +1298,10 @@ pub struct SdpaAttributes<'g, 'h> {
     pub sliding_window_length: Option<i32>,
     pub dropout_probability: Option<f32>,
     pub implementation: Option<AttentionImplementation>,
+    /// Upper bound on the total packed token count of ragged Q (and O/Stats).
+    pub max_total_seq_len_q: Option<usize>,
+    /// Upper bound on the total packed token count of ragged K/V.
+    pub max_total_seq_len_kv: Option<usize>,
     pub name: Option<String>,
     pub bias: Option<Tensor<'g, 'h>>,
     pub seq_len_q: Option<Tensor<'g, 'h>>,
@@ -1360,6 +1370,11 @@ impl<'g, 'h> SdpaAttributes<'g, 'h> {
         self.implementation = Some(i);
         self
     }
+    pub fn max_total_seq_len(mut self, q: usize, kv: usize) -> Self {
+        self.max_total_seq_len_q = Some(q);
+        self.max_total_seq_len_kv = Some(kv);
+        self
+    }
     pub fn name(mut self, n: &str) -> Self {
         self.name = Some(n.to_string());
         self
@@ -1421,6 +1436,10 @@ impl<'h> GraphBuilder<'h> {
                 .implementation
                 .unwrap_or(AttentionImplementation::Auto)
                 .to_ffi(),
+            has_max_total_seq_len_q: attrs.max_total_seq_len_q.is_some() as i32,
+            max_total_seq_len_q: max_total_seq_len(attrs.max_total_seq_len_q),
+            has_max_total_seq_len_kv: attrs.max_total_seq_len_kv.is_some() as i32,
+            max_total_seq_len_kv: max_total_seq_len(attrs.max_total_seq_len_kv),
             name,
             bias: opt_ptr(attrs.bias),
             seq_len_q: opt_ptr(attrs.seq_len_q),
@@ -1459,6 +1478,10 @@ pub struct SdpaBackwardAttributes<'g, 'h> {
     pub sliding_window_length: Option<i32>,
     pub dropout_probability: Option<f32>,
     pub use_deterministic_algorithm: bool,
+    /// Upper bound on the total packed token count of ragged Q (and O/dO/Stats).
+    pub max_total_seq_len_q: Option<usize>,
+    /// Upper bound on the total packed token count of ragged K/V.
+    pub max_total_seq_len_kv: Option<usize>,
     pub name: Option<String>,
     pub bias: Option<Tensor<'g, 'h>>,
     pub dbias: Option<Tensor<'g, 'h>>,
@@ -1482,6 +1505,11 @@ impl<'g, 'h> SdpaBackwardAttributes<'g, 'h> {
     }
     pub fn causal_mask(mut self, v: bool) -> Self {
         self.use_causal_mask = v;
+        self
+    }
+    pub fn max_total_seq_len(mut self, q: usize, kv: usize) -> Self {
+        self.max_total_seq_len_q = Some(q);
+        self.max_total_seq_len_kv = Some(kv);
         self
     }
     pub fn name(mut self, n: &str) -> Self {
@@ -1550,6 +1578,10 @@ impl<'h> GraphBuilder<'h> {
             has_dropout_prob: attrs.dropout_probability.is_some() as i32,
             dropout_probability: attrs.dropout_probability.unwrap_or(0.0),
             use_deterministic_algorithm: attrs.use_deterministic_algorithm as i32,
+            has_max_total_seq_len_q: attrs.max_total_seq_len_q.is_some() as i32,
+            max_total_seq_len_q: max_total_seq_len(attrs.max_total_seq_len_q),
+            has_max_total_seq_len_kv: attrs.max_total_seq_len_kv.is_some() as i32,
+            max_total_seq_len_kv: max_total_seq_len(attrs.max_total_seq_len_kv),
             name,
             bias: opt_ptr(attrs.bias),
             dbias: opt_ptr(attrs.dbias),
