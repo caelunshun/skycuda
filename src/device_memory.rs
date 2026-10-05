@@ -24,30 +24,21 @@ pub struct DeviceMemory {
     ptr: CUdeviceptr_v2,
     len: usize,
     state: Mutex<State>,
+    id: u64,
 }
 
 impl DeviceMemory {
-    pub(crate) fn new_zeroed(
-        len: usize,
-        mem_pool: &DeviceMemoryPool,
-        stream: &Stream,
-    ) -> Result<Self> {
-        let mut memory = unsafe { Self::new_uninit(len, mem_pool, stream)? };
-        stream.fill(&mut memory, 0u8)?;
-        Ok(memory)
-    }
-
     pub(crate) unsafe fn new_uninit(
         len: usize,
         mem_pool: &DeviceMemoryPool,
         stream: &Stream,
+        id: u64,
     ) -> Result<Self> {
         let mut ptr = 0;
         if len > 0 {
             unsafe {
                 cuMemAllocFromPoolAsync(&mut ptr, len, mem_pool.cu_mempool(), stream.cu_stream())
                     .result()?;
-                mem_pool.record_allocation(len);
             }
         }
 
@@ -59,6 +50,7 @@ impl DeviceMemory {
                 last_written_stream: stream.clone(),
                 reading_by_streams: Vec::new(),
             }),
+            id,
         })
     }
 
@@ -100,8 +92,6 @@ impl DeviceMemory {
             cuMemFreeAsync(self.ptr, state.last_written_stream.cu_stream()).result()?;
         }
 
-        self.mem_pool.record_deallocation(self.len);
-
         Ok(())
     }
 }
@@ -111,6 +101,8 @@ impl Drop for DeviceMemory {
         if self.len > 0 {
             let _ = unsafe { self.free() };
         }
+
+        self.mem_pool.record_deallocation(self.id, self.len);
     }
 }
 

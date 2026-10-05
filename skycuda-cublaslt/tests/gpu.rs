@@ -6,7 +6,7 @@
 use half::{bf16, f16};
 use skycuda::{
     device::Device,
-    device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
+    device_memory_pool::DeviceMemoryPool,
     host_pinned_memory::HostPinnedMemory,
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
     stream::Stream,
@@ -514,10 +514,7 @@ fn gemm_device_memory() {
     let f = Fixture::new();
     let device_pool: DeviceMemoryPool = f
         .device
-        .create_device_memory_pool(DeviceMemoryPoolOptions {
-            max_reserved_free_bytes: 1 << 20,
-            max_total_bytes: Some(1 << 30),
-        })
+        .create_device_memory_pool(Default::default())
         .unwrap();
 
     let (m, n, k) = (32usize, 32usize, 32usize);

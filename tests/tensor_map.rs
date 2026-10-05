@@ -41,10 +41,7 @@ impl Fixture {
         let device = Device::from_index(0).unwrap();
         let stream = device.create_stream().unwrap();
         let pool = device
-            .create_device_memory_pool(DeviceMemoryPoolOptions {
-                max_reserved_free_bytes: 0,
-                max_total_bytes: None,
-            })
+            .create_device_memory_pool(DeviceMemoryPoolOptions::default())
             .unwrap();
         Self {
             device,
