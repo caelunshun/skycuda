@@ -63,6 +63,15 @@ impl DeviceMemoryPool {
         DeviceMemory::new_zeroed(len, self, stream)
     }
 
+    /// Allocate uninitialized device memory.
+    ///
+    /// # Safety
+    /// Reading or creating Rust references to the underlying buffer contents before they are written to is undefined
+    /// behavior.
+    pub unsafe fn alloc_uninit_on(&self, len: usize, stream: &Stream) -> Result<DeviceMemory> {
+        unsafe { DeviceMemory::new_uninit(len, self, stream) }
+    }
+
     pub fn cu_mempool(&self) -> CUmemoryPool {
         self.0.cu_mempool
     }

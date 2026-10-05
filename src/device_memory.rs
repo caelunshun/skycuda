@@ -5,9 +5,7 @@ use crate::{
     memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
 };
-use cudarc::driver::sys::{
-    CUdeviceptr_v2, cuMemAllocFromPoolAsync, cuMemFreeAsync, cuMemsetD8Async,
-};
+use cudarc::driver::sys::{CUdeviceptr_v2, cuMemAllocFromPoolAsync, cuMemFreeAsync};
 use std::{ops::RangeBounds, sync::Mutex};
 
 /// Raw, untyped wrapper over a device-local memory allocation.
@@ -34,13 +32,22 @@ impl DeviceMemory {
         mem_pool: &DeviceMemoryPool,
         stream: &Stream,
     ) -> Result<Self> {
+        let mut memory = unsafe { Self::new_uninit(len, mem_pool, stream)? };
+        stream.fill(&mut memory, 0u8)?;
+        Ok(memory)
+    }
+
+    pub(crate) unsafe fn new_uninit(
+        len: usize,
+        mem_pool: &DeviceMemoryPool,
+        stream: &Stream,
+    ) -> Result<Self> {
         let mut ptr = 0;
         if len > 0 {
             unsafe {
                 cuMemAllocFromPoolAsync(&mut ptr, len, mem_pool.cu_mempool(), stream.cu_stream())
                     .result()?;
                 mem_pool.record_allocation(len);
-                cuMemsetD8Async(ptr, 0, len, stream.cu_stream()).result()?;
             }
         }
 
