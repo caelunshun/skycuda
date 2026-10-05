@@ -35,7 +35,7 @@ impl DeviceMemoryPool {
                 },
             },
             win32SecurityAttributes: ptr::null_mut(),
-            maxSize: 1 << 40,
+            maxSize: options.max_total_bytes.unwrap_or(1 << 40),
             usage: 0,
             gpuDirectRDMACapable: 0,
             reserved: [0; _],
@@ -50,18 +50,6 @@ impl DeviceMemoryPool {
                 &mut max_bytes as *mut u64 as *mut c_void,
             )
             .result()?;
-        }
-
-        if let Some(max_total_bytes) = options.max_total_bytes {
-            let mut max_total_bytes = max_total_bytes as u64;
-            unsafe {
-                cuMemPoolSetAttribute(
-                    cu_mempool,
-                    CU_MEMPOOL_ATTR_MAX_POOL_SIZE,
-                    &mut max_total_bytes as *mut u64 as *mut c_void,
-                )
-                .result()?;
-            }
         }
 
         Ok(Self(Arc::new(Inner {
