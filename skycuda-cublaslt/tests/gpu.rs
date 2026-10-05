@@ -516,6 +516,7 @@ fn gemm_device_memory() {
         .device
         .create_device_memory_pool(DeviceMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 20,
+            max_total_bytes: Some(1 << 30),
         })
         .unwrap();
 

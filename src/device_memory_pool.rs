@@ -1,11 +1,12 @@
 use crate::{device::Device, device_memory::DeviceMemory, error::Result, stream::Stream};
 use bytesize::ByteSize;
 use cudarc::driver::sys::{
-    CUmemAllocationHandleType, CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
+    CUmemAllocationHandleType,
+    CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
     CUmemLocation_st, CUmemLocation_st__bindgen_ty_1,
     CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-    CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, CUmemPoolProps_st, CUmemoryPool,
-    cuMemPoolCreate, cuMemPoolDestroy, cuMemPoolSetAttribute,
+    CUmemPool_attribute::{CU_MEMPOOL_ATTR_MAX_POOL_SIZE, CU_MEMPOOL_ATTR_RELEASE_THRESHOLD},
+    CUmemPoolProps_st, CUmemoryPool, cuMemPoolCreate, cuMemPoolDestroy, cuMemPoolSetAttribute,
 };
 use std::{
     ffi::c_void,
@@ -49,6 +50,18 @@ impl DeviceMemoryPool {
                 &mut max_bytes as *mut u64 as *mut c_void,
             )
             .result()?;
+        }
+
+        if let Some(max_total_bytes) = options.max_total_bytes {
+            let mut max_total_bytes = max_total_bytes as u64;
+            unsafe {
+                cuMemPoolSetAttribute(
+                    cu_mempool,
+                    CU_MEMPOOL_ATTR_MAX_POOL_SIZE,
+                    &mut max_total_bytes as *mut u64 as *mut c_void,
+                )
+                .result()?;
+            }
         }
 
         Ok(Self(Arc::new(Inner {
@@ -141,4 +154,5 @@ impl Drop for Inner {
 #[derive(Debug, Clone)]
 pub struct DeviceMemoryPoolOptions {
     pub max_reserved_free_bytes: usize,
+    pub max_total_bytes: Option<usize>,
 }

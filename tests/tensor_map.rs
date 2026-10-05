@@ -43,6 +43,7 @@ impl Fixture {
         let pool = device
             .create_device_memory_pool(DeviceMemoryPoolOptions {
                 max_reserved_free_bytes: 0,
+                max_total_bytes: None,
             })
             .unwrap();
         Self {
