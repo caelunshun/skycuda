@@ -106,7 +106,13 @@ impl Device {
 
     /// Loads Tile IR bytecode, which the CUDA driver JIT-compiles for this device.
     /// Invalid magic is rejected before calling the driver.
-    pub fn load_module_tileir(&self, bytecode: &[u8]) -> Result<Module> {
+    ///
+    /// # Safety
+    /// `bytecode` must be complete, well-formed Tile IR bytecode. The driver is
+    /// not given the length and reads past the end of truncated input. Garbage
+    /// that passes the magic check fails with the misleading
+    /// `CUDA_ERROR_JIT_COMPILER_NOT_FOUND`.
+    pub unsafe fn load_module_tileir(&self, bytecode: &[u8]) -> Result<Module> {
         if !bytecode.starts_with(b"\x7fTileIR\0") {
             return Err(crate::error::Error::InvalidTileIrMagic);
         }
