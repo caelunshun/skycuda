@@ -99,7 +99,10 @@ impl DeviceMemory {
 impl Drop for DeviceMemory {
     fn drop(&mut self) {
         if self.len > 0 {
-            let _ = unsafe { self.free() };
+            let res = unsafe { self.free() };
+            if let Err(e) = res {
+                tracing::error!("failed to free memory: {e:?}");
+            }
         }
 
         self.mem_pool.record_deallocation(self.id, self.len);

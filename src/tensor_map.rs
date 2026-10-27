@@ -186,16 +186,58 @@ impl TensorMapOobFill {
     }
 }
 
-/// Description of a tiled tensor map, independent of the memory it addresses.
+impl TensorMapSwizzle {
+    /// Bytes after which the swizzle pattern repeats in shared memory, or
+    /// `None` without swizzling.
+    fn pattern_bytes(self) -> Option<u64> {
+        use TensorMapSwizzle::*;
+        match self {
+            None => Option::None,
+            B32 | B128Atom64B => Some(256),
+            B64 | B128Atom32B | B128Atom32BFlip8B => Some(512),
+            B128 => Some(1024),
+        }
+    }
+}
+
+/// Why a [`TensorMapLayout`] is invalid. See [`TensorMapLayout::check`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TensorMapLayoutError {
+    #[error("interleaved tensor maps must have rank >= 3")]
+    InterleaveRank { rank: usize },
+    #[error("tensor map box dim {dim} must be in 1..=256, got {value}")]
+    BoxDimOutOfRange { dim: usize, value: u32 },
+    #[error("tensor map element stride {dim} must be in 1..=8, got {value}")]
+    ElementStrideOutOfRange { dim: usize, value: u32 },
+    #[error("32B-interleaved tensor maps require 32B swizzle")]
+    Interleave32RequiresSwizzle32 { swizzle: TensorMapSwizzle },
+    #[error("{data_type:?} tensor maps require no interleave")]
+    PackedInterleave {
+        data_type: TensorMapDataType,
+        interleave: TensorMapInterleave,
+    },
+    #[error("{data_type:?} tensor maps require box dim 0 to be 128, got {value}")]
+    PackedBoxDim0 {
+        data_type: TensorMapDataType,
+        value: u32,
+    },
+    #[error("tensor map inner box dimension must be a multiple of 16 bytes, got {bytes}")]
+    InnerBoxNotMultipleOf16 { bytes: u64 },
+    #[error("tensor map inner box dimension ({bytes} bytes) exceeds swizzle span ({span} bytes)")]
+    InnerBoxExceedsSwizzleSpan { bytes: u64, span: u64 },
+}
+
+/// The launch-independent part of a tiled tensor map: what a kernel is built
+/// against. Everything that depends on the tensor in global memory lives in
+/// [`TensorMapDesc`] instead.
 ///
-/// Dimension 0 is the innermost (contiguous) dimension. `global_strides[i]` is
-/// the byte stride of dimension `i + 1`.
-#[derive(Debug, Clone)]
-pub struct TensorMapDesc {
+/// Dimension 0 is the innermost (contiguous) dimension. Needs no GPU or
+/// driver: [`box_bytes`](Self::box_bytes), [`smem_alignment`](Self::smem_alignment)
+/// and [`check`](Self::check) are pure functions of the layout.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TensorMapLayout {
     data_type: TensorMapDataType,
     rank: usize,
-    global_dims: [u64; MAX_RANK],
-    global_strides: [u64; MAX_RANK - 1],
     box_dims: [u32; MAX_RANK],
     element_strides: [u32; MAX_RANK],
     interleave: TensorMapInterleave,
@@ -204,35 +246,18 @@ pub struct TensorMapDesc {
     oob_fill: TensorMapOobFill,
 }
 
-impl TensorMapDesc {
-    pub fn new(
-        data_type: TensorMapDataType,
-        global_dims: &[u64],
-        global_strides: &[u64],
-        box_dims: &[u32],
-    ) -> Self {
-        let rank = global_dims.len();
+impl TensorMapLayout {
+    /// The rank is `box_dims.len()`, which must be in `1..=MAX_RANK`. Unused
+    /// trailing slots are kept at 1 so that equal layouts compare and hash equal.
+    pub fn new(data_type: TensorMapDataType, box_dims: &[u32]) -> Self {
+        let rank = box_dims.len();
         assert!(
             (1..=MAX_RANK).contains(&rank),
             "tensor map rank must be in 1..={MAX_RANK}, got {rank}"
         );
-        assert_eq!(
-            global_strides.len(),
-            rank - 1,
-            "tensor map of rank {rank} needs exactly {} global strides",
-            rank - 1
-        );
-        assert_eq!(
-            box_dims.len(),
-            rank,
-            "tensor map of rank {rank} needs exactly {rank} box dims"
-        );
-
-        let mut desc = Self {
+        let mut layout = Self {
             data_type,
             rank,
-            global_dims: [1; MAX_RANK],
-            global_strides: [0; MAX_RANK - 1],
             box_dims: [1; MAX_RANK],
             element_strides: [1; MAX_RANK],
             interleave: TensorMapInterleave::default(),
@@ -240,10 +265,8 @@ impl TensorMapDesc {
             l2_promotion: TensorMapL2Promotion::default(),
             oob_fill: TensorMapOobFill::default(),
         };
-        desc.global_dims[..rank].copy_from_slice(global_dims);
-        desc.global_strides[..rank - 1].copy_from_slice(global_strides);
-        desc.box_dims[..rank].copy_from_slice(box_dims);
-        desc
+        layout.box_dims[..rank].copy_from_slice(box_dims);
+        layout
     }
 
     #[must_use]
@@ -291,21 +314,312 @@ impl TensorMapDesc {
         self.rank
     }
 
-    pub fn global_dims(&self) -> &[u64] {
-        &self.global_dims[..self.rank]
-    }
-
-    pub fn global_strides(&self) -> &[u64] {
-        &self.global_strides[..self.rank - 1]
-    }
-
     pub fn box_dims(&self) -> &[u32] {
         &self.box_dims[..self.rank]
     }
 
+    pub fn get_element_strides(&self) -> &[u32] {
+        &self.element_strides[..self.rank]
+    }
+
+    pub fn get_interleave(&self) -> TensorMapInterleave {
+        self.interleave
+    }
+
+    pub fn get_swizzle(&self) -> TensorMapSwizzle {
+        self.swizzle
+    }
+
+    pub fn get_l2_promotion(&self) -> TensorMapL2Promotion {
+        self.l2_promotion
+    }
+
+    pub fn get_oob_fill(&self) -> TensorMapOobFill {
+        self.oob_fill
+    }
+
+    /// Bytes one box occupies in shared memory, which is also the byte count a
+    /// TMA load completes on its mbarrier (`expect_tx`).
+    ///
+    /// Along dimension `i` the box holds `ceil(box_dim[i] / element_stride[i])`
+    /// elements, because the driver steps by the element stride. Dimension 0's
+    /// element stride is ignored unless the layout is interleaved. The bytes
+    /// are `row_bytes * prod(count[i] for i >= 1)`, where `row_bytes` is the
+    /// size of dimension 0:
+    /// - ordinary types: `count[0] * element size`;
+    /// - [`TensorMapDataType::U4x16Align8B`]: `ceil(count[0] / 16) * 8`
+    ///   (16 values pack into 8 bytes, no gaps);
+    /// - [`TensorMapDataType::U4x16Align16B`] and
+    ///   [`TensorMapDataType::U6x16Align16B`]: `ceil(count[0] / 16) * 16` (each
+    ///   group of 16 values takes a 16-byte slot in shared memory, with an
+    ///   8-byte or 4-byte gap);
+    /// - interleaved layouts ([`TensorMapInterleave::B16`], `B32`): `row_bytes`
+    ///   is then rounded up to a whole 16 or 32-byte channel slice. This
+    ///   matches the zero-padding of the last slice in global memory (PTX ISA
+    ///   5.5.6) but is not stated for shared memory by the driver docs. It is
+    ///   a no-op whenever the dimension-0 bytes are already a multiple of the
+    ///   slice.
+    ///
+    /// Swizzling and the L2 and OOB modes do not change the size. Does not
+    /// validate the layout; see [`check`](Self::check).
+    pub fn box_bytes(&self) -> u64 {
+        let counts = |i: usize| {
+            let stride = if i == 0 && self.interleave == TensorMapInterleave::None {
+                1
+            } else {
+                u64::from(self.element_strides[i]).max(1)
+            };
+            u64::from(self.box_dims[i]).div_ceil(stride)
+        };
+        let mut row_bytes = self.row_bytes(counts(0));
+        match self.interleave {
+            TensorMapInterleave::None => {}
+            TensorMapInterleave::B16 => row_bytes = row_bytes.next_multiple_of(16),
+            TensorMapInterleave::B32 => row_bytes = row_bytes.next_multiple_of(32),
+        }
+        (1..self.rank).fold(row_bytes, |bytes, i| bytes * counts(i))
+    }
+
+    /// Bytes of `count` elements along dimension 0 in shared memory.
+    fn row_bytes(&self, count: u64) -> u64 {
+        match self.data_type {
+            TensorMapDataType::U4x16Align8B => count.div_ceil(16) * 8,
+            TensorMapDataType::U4x16Align16B | TensorMapDataType::U6x16Align16B => {
+                count.div_ceil(16) * 16
+            }
+            ty => count * ty.size_bytes().unwrap(),
+        }
+    }
+
+    /// Alignment in bytes of a shared-memory destination (and so of a box
+    /// stride between pipeline stages), at which the swizzle pattern starts at
+    /// its first row.
+    ///
+    /// Every tensor copy requires 128 bytes (CUDA programming guide, table of
+    /// alignment requirements for bulk tensor copies). The swizzle is a
+    /// function of the shared-memory address, so with a swizzle mode the
+    /// destination should be aligned to the bytes after which the pattern
+    /// repeats; a destination only 128-byte aligned is legal but the pattern
+    /// is rotated by `(address / 128) % rows` rows (programming guide, table 24):
+    /// - no swizzle: 128;
+    /// - `B32`: 256, `B64`: 512, `B128`: 1024 (programming guide table 25,
+    ///   PTX ISA 5.5.7);
+    /// - `B128Atom32B` and `B128Atom32BFlip8B`: 512 (the pattern repeats after
+    ///   4 rows of 128 bytes in PTX ISA 5.5.7, and is `Swizzle<2,5,2>` in
+    ///   CUTLASS's `SWIZZLE_128B_BASE32B`);
+    /// - `B128Atom64B`: 256 (repeats after 2 rows).
+    ///
+    /// The atom modes' own minimum alignments (32 and 64 bytes, PTX ISA
+    /// 5.5.7) are below 128. CUTLASS aligns all 128-byte swizzled buffers to
+    /// 1024, which is also valid for every mode here.
+    pub fn smem_alignment(&self) -> u64 {
+        self.swizzle.pattern_bytes().unwrap_or(0).max(128)
+    }
+
+    /// The layout-only rules of `cuTensorMapEncodeTiled`, which a kernel can
+    /// check at build time:
+    /// - interleaving needs rank >= 3, and `U6x16Align16B` forbids it;
+    /// - box dims in `1..=256` and element strides in `1..=8`;
+    /// - 32-byte interleave needs 32-byte swizzle;
+    /// - `U4x16Align16B` and `U6x16Align16B` need box dim 0 of 128;
+    /// - without interleave, the bytes of box dim 0 (as in
+    ///   [`box_bytes`](Self::box_bytes), ignoring the element stride) are a
+    ///   multiple of 16 and at most the swizzle span (32, 64 or 128 bytes).
+    ///
+    /// It does not check the rules the driver leaves to the data type and
+    /// access direction (NaN OOB fill needs a floating-point type, the swizzle
+    /// modes supported by the packed types, and load-only or store-only modes).
+    pub fn check(&self) -> Result<(), TensorMapLayoutError> {
+        use TensorMapLayoutError::*;
+        if self.interleave != TensorMapInterleave::None && self.rank < 3 {
+            return Err(InterleaveRank { rank: self.rank });
+        }
+        for (dim, &value) in self.box_dims().iter().enumerate() {
+            if !(1..=256).contains(&value) {
+                return Err(BoxDimOutOfRange { dim, value });
+            }
+        }
+        for (dim, &value) in self.get_element_strides().iter().enumerate() {
+            if !(1..=8).contains(&value) {
+                return Err(ElementStrideOutOfRange { dim, value });
+            }
+        }
+        if self.interleave == TensorMapInterleave::B32 && self.swizzle != TensorMapSwizzle::B32 {
+            return Err(Interleave32RequiresSwizzle32 {
+                swizzle: self.swizzle,
+            });
+        }
+        if self.data_type == TensorMapDataType::U6x16Align16B
+            && self.interleave != TensorMapInterleave::None
+        {
+            return Err(PackedInterleave {
+                data_type: self.data_type,
+                interleave: self.interleave,
+            });
+        }
+        if self.data_type.is_packed_align16() && self.box_dims[0] != 128 {
+            return Err(PackedBoxDim0 {
+                data_type: self.data_type,
+                value: self.box_dims[0],
+            });
+        }
+        if self.interleave == TensorMapInterleave::None {
+            let bytes = self.row_bytes(u64::from(self.box_dims[0]));
+            if !bytes.is_multiple_of(16) {
+                return Err(InnerBoxNotMultipleOf16 { bytes });
+            }
+            if let Some(span) = self.swizzle.span_bytes()
+                && bytes > span
+            {
+                return Err(InnerBoxExceedsSwizzleSpan { bytes, span });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Description of a tiled tensor map: a [`TensorMapLayout`] plus the shape of
+/// the tensor in global memory, independent of the memory it addresses.
+///
+/// Dimension 0 is the innermost (contiguous) dimension. `global_strides[i]` is
+/// the byte stride of dimension `i + 1`.
+#[derive(Debug, Clone)]
+pub struct TensorMapDesc {
+    layout: TensorMapLayout,
+    global_dims: [u64; MAX_RANK],
+    global_strides: [u64; MAX_RANK - 1],
+}
+
+impl TensorMapDesc {
+    /// Shorthand for
+    /// `from_layout(&TensorMapLayout::new(data_type, box_dims), global_dims, global_strides)`.
+    pub fn new(
+        data_type: TensorMapDataType,
+        global_dims: &[u64],
+        global_strides: &[u64],
+        box_dims: &[u32],
+    ) -> Self {
+        let rank = global_dims.len();
+        assert_eq!(
+            box_dims.len(),
+            rank,
+            "tensor map of rank {rank} needs exactly {rank} box dims"
+        );
+        Self::from_layout(
+            &TensorMapLayout::new(data_type, box_dims),
+            global_dims,
+            global_strides,
+        )
+    }
+
+    /// `global_dims` must have the layout's rank and `global_strides` one fewer.
+    pub fn from_layout(
+        layout: &TensorMapLayout,
+        global_dims: &[u64],
+        global_strides: &[u64],
+    ) -> Self {
+        let rank = layout.rank;
+        assert_eq!(
+            global_dims.len(),
+            rank,
+            "tensor map of rank {rank} needs exactly {rank} global dims"
+        );
+        assert_eq!(
+            global_strides.len(),
+            rank - 1,
+            "tensor map of rank {rank} needs exactly {} global strides",
+            rank - 1
+        );
+
+        let mut desc = Self {
+            layout: layout.clone(),
+            global_dims: [1; MAX_RANK],
+            global_strides: [0; MAX_RANK - 1],
+        };
+        desc.global_dims[..rank].copy_from_slice(global_dims);
+        desc.global_strides[..rank - 1].copy_from_slice(global_strides);
+        desc
+    }
+
+    pub fn layout(&self) -> &TensorMapLayout {
+        &self.layout
+    }
+
+    #[must_use]
+    pub fn element_strides(mut self, element_strides: &[u32]) -> Self {
+        self.layout = self.layout.element_strides(element_strides);
+        self
+    }
+
+    #[must_use]
+    pub fn interleave(mut self, interleave: TensorMapInterleave) -> Self {
+        self.layout = self.layout.interleave(interleave);
+        self
+    }
+
+    #[must_use]
+    pub fn swizzle(mut self, swizzle: TensorMapSwizzle) -> Self {
+        self.layout = self.layout.swizzle(swizzle);
+        self
+    }
+
+    #[must_use]
+    pub fn l2_promotion(mut self, l2_promotion: TensorMapL2Promotion) -> Self {
+        self.layout = self.layout.l2_promotion(l2_promotion);
+        self
+    }
+
+    #[must_use]
+    pub fn oob_fill(mut self, oob_fill: TensorMapOobFill) -> Self {
+        self.layout = self.layout.oob_fill(oob_fill);
+        self
+    }
+
+    pub fn data_type(&self) -> TensorMapDataType {
+        self.layout.data_type
+    }
+
+    pub fn rank(&self) -> usize {
+        self.layout.rank
+    }
+
+    pub fn global_dims(&self) -> &[u64] {
+        &self.global_dims[..self.layout.rank]
+    }
+
+    pub fn global_strides(&self) -> &[u64] {
+        &self.global_strides[..self.layout.rank - 1]
+    }
+
+    pub fn box_dims(&self) -> &[u32] {
+        self.layout.box_dims()
+    }
+
+    pub fn get_element_strides(&self) -> &[u32] {
+        self.layout.get_element_strides()
+    }
+
+    pub fn get_interleave(&self) -> TensorMapInterleave {
+        self.layout.interleave
+    }
+
+    pub fn get_swizzle(&self) -> TensorMapSwizzle {
+        self.layout.swizzle
+    }
+
+    pub fn get_l2_promotion(&self) -> TensorMapL2Promotion {
+        self.layout.l2_promotion
+    }
+
+    pub fn get_oob_fill(&self) -> TensorMapOobFill {
+        self.layout.oob_fill
+    }
+
     /// Required alignment of the global address and the global strides.
     pub fn alignment(&self) -> u64 {
-        if self.interleave == TensorMapInterleave::B32 || self.data_type.is_packed_align16() {
+        if self.layout.interleave == TensorMapInterleave::B32
+            || self.layout.data_type.is_packed_align16()
+        {
             32
         } else {
             16
@@ -316,7 +630,7 @@ impl TensorMapDesc {
     /// the tensor map can address.
     pub fn footprint_bytes(&self) -> usize {
         let dim0 = self.global_dims[0];
-        let mut row0_bytes = match self.data_type {
+        let mut row0_bytes = match self.layout.data_type {
             TensorMapDataType::U4x16Align8B => dim0.div_ceil(2),
             TensorMapDataType::U4x16Align16B | TensorMapDataType::U6x16Align16B => {
                 dim0.div_ceil(16) * 16
@@ -325,7 +639,7 @@ impl TensorMapDesc {
                 .checked_mul(ty.size_bytes().unwrap())
                 .expect("tensor map footprint overflow"),
         };
-        match self.interleave {
+        match self.layout.interleave {
             TensorMapInterleave::None => {}
             TensorMapInterleave::B16 => row0_bytes = row0_bytes.next_multiple_of(16),
             TensorMapInterleave::B32 => row0_bytes = row0_bytes.next_multiple_of(32),
@@ -344,9 +658,8 @@ impl TensorMapDesc {
     }
 
     fn validate(&self) {
-        let rank = self.rank;
-        if self.interleave != TensorMapInterleave::None {
-            assert!(rank >= 3, "interleaved tensor maps must have rank >= 3");
+        if let Err(e) = self.layout.check() {
+            panic!("{e}");
         }
         for (i, &dim) in self.global_dims().iter().enumerate() {
             assert!(
@@ -361,27 +674,8 @@ impl TensorMapDesc {
                 "tensor map global stride {i} must be a multiple of {alignment} and less than 2^40, got {stride}"
             );
         }
-        for (i, &dim) in self.box_dims().iter().enumerate() {
-            assert!(
-                (1..=256).contains(&dim),
-                "tensor map box dim {i} must be in 1..=256, got {dim}"
-            );
-        }
-        for (i, &stride) in self.element_strides[..rank].iter().enumerate() {
-            assert!(
-                (1..=8).contains(&stride),
-                "tensor map element stride {i} must be in 1..=8, got {stride}"
-            );
-        }
-        if self.interleave == TensorMapInterleave::B32 {
-            assert_eq!(
-                self.swizzle,
-                TensorMapSwizzle::B32,
-                "32B-interleaved tensor maps require 32B swizzle"
-            );
-        }
 
-        match self.data_type {
+        match self.layout.data_type {
             TensorMapDataType::U4x16Align8B => assert!(
                 self.global_dims[0].is_multiple_of(2),
                 "U4x16Align8B tensor maps require global dim 0 to be a multiple of 2"
@@ -390,31 +684,10 @@ impl TensorMapDesc {
                 assert!(
                     self.global_dims[0].is_multiple_of(128),
                     "{:?} tensor maps require global dim 0 to be a multiple of 128",
-                    self.data_type
-                );
-                assert_eq!(
-                    self.box_dims[0], 128,
-                    "{:?} tensor maps require box dim 0 to be 128",
-                    self.data_type
+                    self.layout.data_type
                 );
             }
             _ => {}
-        }
-
-        if let Some(elem_bytes) = self.data_type.size_bytes()
-            && self.interleave == TensorMapInterleave::None
-        {
-            let inner_bytes = u64::from(self.box_dims[0]) * elem_bytes;
-            assert!(
-                inner_bytes.is_multiple_of(16),
-                "tensor map inner box dimension must be a multiple of 16 bytes, got {inner_bytes}"
-            );
-            if let Some(span) = self.swizzle.span_bytes() {
-                assert!(
-                    inner_bytes <= span,
-                    "tensor map inner box dimension ({inner_bytes} bytes) exceeds swizzle span ({span} bytes)"
-                );
-            }
         }
     }
 
@@ -425,17 +698,17 @@ impl TensorMapDesc {
         unsafe {
             cuTensorMapEncodeTiled(
                 &mut repr.0,
-                self.data_type.to_ffi(),
-                self.rank as u32,
+                self.layout.data_type.to_ffi(),
+                self.layout.rank as u32,
                 address as *mut _,
                 self.global_dims.as_ptr(),
                 self.global_strides.as_ptr(),
-                self.box_dims.as_ptr(),
-                self.element_strides.as_ptr(),
-                self.interleave.to_ffi(),
-                self.swizzle.to_ffi(),
-                self.l2_promotion.to_ffi(),
-                self.oob_fill.to_ffi(),
+                self.layout.box_dims.as_ptr(),
+                self.layout.element_strides.as_ptr(),
+                self.layout.interleave.to_ffi(),
+                self.layout.swizzle.to_ffi(),
+                self.layout.l2_promotion.to_ffi(),
+                self.layout.oob_fill.to_ffi(),
             )
             .result()?;
         }
