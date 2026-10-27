@@ -2,6 +2,8 @@ use std::num::TryFromIntError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid Tile IR bytecode magic")]
+    InvalidTileIrMagic,
     #[error(transparent)]
     CudaDriver(#[from] cudarc::driver::result::DriverError),
     #[error(transparent)]

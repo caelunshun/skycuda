@@ -104,6 +104,15 @@ impl Device {
         unsafe { Module::new(cubin, self) }
     }
 
+    /// Loads Tile IR bytecode, which the CUDA driver JIT-compiles for this device.
+    /// Invalid magic is rejected before calling the driver.
+    pub fn load_module_tileir(&self, bytecode: &[u8]) -> Result<Module> {
+        if !bytecode.starts_with(b"\x7fTileIR\0") {
+            return Err(crate::error::Error::InvalidTileIrMagic);
+        }
+        unsafe { Module::new(bytecode, self) }
+    }
+
     pub fn ordinal(&self) -> u32 {
         self.0.device_ordinal.try_into().unwrap()
     }
