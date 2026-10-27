@@ -12,6 +12,7 @@ pub struct Function(Arc<Inner>);
 impl Function {
     pub(crate) fn new(symbol_name: &str, module: &Module) -> Result<Self> {
         let mut cu_function = ptr::null_mut();
+        let name = symbol_name.to_owned();
         let symbol_name = CString::new(symbol_name)?;
         unsafe {
             cuModuleGetFunction(&mut cu_function, module.cu_module(), symbol_name.as_ptr())
@@ -43,9 +44,15 @@ impl Function {
 
         Ok(Self(Arc::new(Inner {
             module: module.clone(),
+            name,
             cu_function,
             param_sizes,
         })))
+    }
+
+    /// The symbol name this function was looked up by.
+    pub fn name(&self) -> &str {
+        &self.0.name
     }
 
     pub fn module(&self) -> &Module {
@@ -99,6 +106,7 @@ impl Function {
 #[derive(Debug)]
 struct Inner {
     module: Module,
+    name: String,
     cu_function: CUfunction,
     param_sizes: Vec<usize>,
 }
