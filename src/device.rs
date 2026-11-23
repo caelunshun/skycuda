@@ -19,8 +19,9 @@ use cudarc::driver::{
         },
         CUevent,
         CUevent_flags::{CU_EVENT_DEFAULT, CU_EVENT_DISABLE_TIMING},
-        cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
-        cuEventDestroy_v2,
+        CUlimit::CU_LIMIT_MALLOC_HEAP_SIZE,
+        cuCtxCreate_v4, cuCtxDestroy_v2, cuCtxSetCurrent, cuCtxSetLimit, cuDeviceGetAttribute,
+        cuEventCreate, cuEventDestroy_v2,
     },
 };
 use std::{
@@ -156,6 +157,14 @@ impl Device {
 
     pub fn max_dynamic_smem_per_cta(&self) -> usize {
         self.0.cached_attributes.max_dynamic_smem
+    }
+
+    pub fn set_max_heap_size(&self, size: usize) -> Result<()> {
+        self.set_as_current()?;
+        unsafe {
+            cuCtxSetLimit(CU_LIMIT_MALLOC_HEAP_SIZE, size).result()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn take_pooled_cu_event(&self, timing_enabled: bool) -> Result<CUevent> {
